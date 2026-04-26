@@ -71,6 +71,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     n: Optional[int] = 1
+    return_token_ids: Optional[bool] = False
 
 def count_tokens(text: str, model_name: str) -> int:
     """Count tokens using the appropriate tokenizer."""
@@ -182,10 +183,11 @@ async def chat_completions(request: ChatCompletionRequest):
             # Generate tokens
             stream_start_time = time.perf_counter()
             token_text = COHERENCE_TEST_RESPONSE + " " if is_coherence_test else "mock "
-            token_ids = get_token_ids(token_text, request.model)
-            
+            all_token_ids = get_token_ids(token_text, request.model)
+            single_token_id = all_token_ids[0] if all_token_ids else 0
+
             include_token_ids = request.return_token_ids if hasattr(request, 'return_token_ids') else False
-            
+
             for i in range(num_completion_tokens):
                 target_time = stream_start_time + ((i + 1) * token_interval)
                 now = time.perf_counter()
@@ -209,7 +211,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 }
                 
                 if include_token_ids:
-                    chunk["choices"][0]["token_ids"] = token_ids
+                    chunk["choices"][0]["token_ids"] = [single_token_id]
                 
                 yield f"data: {json.dumps(chunk)}\n\n"
             
