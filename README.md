@@ -198,7 +198,7 @@ The script attempts to estimate network or processing latency to provide "server
 
 -   **`t/s` (Tokens per Second)**:
     -   **For Prompt Processing (pp)**: Calculated as `Total Prompt Tokens / est_ppt`. This represents the prefill speed.
-    -   **For Token Generation (tg)**: Calculated as `(Total Generated Tokens - 1) / (Time of Last Token - Time of First Token)`. This represents the decode speed, excluding the first token latency.
+    -   **For Token Generation (tg)**: Calculated as `(Total Generated Tokens - 1) / (Time of Last Token - Time of First Token)`. This represents the decode speed, excluding the first token latency. If the backend emits the whole response, or a block of tokens, in a single content-bearing stream chunk, there is no observable token-to-token interval and decode throughput is left blank instead of reporting a protocol-timing artifact.
         -   When `concurrency` > 1:
         -   **`t/s (total)`**: Total throughput across all concurrent requests.
         -   **`t/s (req)`**: Average throughput per individual request.
