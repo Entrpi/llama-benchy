@@ -1,9 +1,12 @@
 import numpy as np
 from tabulate import tabulate
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from pydantic import BaseModel, Field
 import json
 import csv
+import html
+import io
+import math
 import sys
 
 from .client import RequestResult
@@ -350,6 +353,81 @@ class BenchmarkResults:
             else:
                 agg_peak_throughputs.append(res)
 
+    def _generate_sweep_rows(self) -> List[Dict[str, Any]]:
+        rows = []
+        for run in self.runs:
+            if run.is_context_prefill_phase:
+                continue
+            if not run.pp_throughput or not run.tg_throughput:
+                continue
+
+            rows.append({
+                "ctx_tokens": run.context_size,
+                "prefill_tokens": run.prompt_size,
+                "prefill_tps": run.pp_throughput.mean,
+                "gen_tokens": run.response_size,
+                "gen_tps": run.tg_throughput.mean,
+                "kvcache_bytes": "",
+                "concurrency": run.concurrency,
+                "prefill_tps_req": run.pp_req_throughput.mean if run.pp_req_throughput else "",
+                "gen_tps_req": run.tg_req_throughput.mean if run.tg_req_throughput else "",
+                "peak_gen_tps": run.peak_throughput.mean if run.peak_throughput else "",
+                "peak_gen_tps_req": run.peak_req_throughput.mean if run.peak_req_throughput else "",
+                "ttfr_ms": run.ttfr.mean if run.ttfr else "",
+                "est_ppt_ms": run.est_ppt.mean if run.est_ppt else "",
+                "e2e_ttft_ms": run.e2e_ttft.mean if run.e2e_ttft else "",
+            })
+
+        return sorted(
+            rows,
+            key=lambda row: (
+                int(row["concurrency"]),
+                int(row["prefill_tokens"]),
+                int(row["gen_tokens"]),
+                int(row["ctx_tokens"]),
+            ),
+        )
+
+    def _generate_sweep_csv(self) -> str:
+        rows = self._generate_sweep_rows()
+        if not rows:
+            return ""
+
+        headers = [
+            "ctx_tokens",
+            "prefill_tokens",
+            "prefill_tps",
+            "gen_tokens",
+            "gen_tps",
+            "kvcache_bytes",
+            "concurrency",
+            "prefill_tps_req",
+            "gen_tps_req",
+            "peak_gen_tps",
+            "peak_gen_tps_req",
+            "ttfr_ms",
+            "est_ppt_ms",
+            "e2e_ttft_ms",
+        ]
+
+        def fmt_value(value: Any) -> Any:
+            if isinstance(value, float):
+                return f"{value:.6g}"
+            return value
+
+        fp = io.StringIO()
+        writer = csv.DictWriter(fp, fieldnames=headers, lineterminator="\n")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: fmt_value(row[key]) for key in headers})
+        return fp.getvalue()
+
+    def _generate_sweep_svg(self, title: Optional[str] = None, width: int = 960, height: int = 540) -> str:
+        rows = self._generate_sweep_rows()
+        if len(rows) < 1:
+            return _render_empty_svg(title or "llama-benchy sweep", width, height)
+        return _render_sweep_svg(rows, title or _derive_sweep_title(self.model_name), width, height)
+
 
     def _generate_rows(self) -> List[Dict[str, Any]]:
         rows = []
@@ -458,7 +536,7 @@ class BenchmarkResults:
 
         return tabulate(data, headers=headers, tablefmt="pipe", colalign=("left", "right", "right", "right", "right", "right", "right", "right", "right") if concurrency > 1 else ("left", "right", "right", "right", "right", "right", "right"))
 
-    def save_report(self, filename: Optional[str], format: str, concurrency: int = 1):
+    def save_report(self, filename: Optional[str], format: str, concurrency: int = 1, sweep_title: Optional[str] = None):
         msg = ""
         if filename:
             msg += f"Saving results to {filename} in {format.upper()} format...\n"
@@ -528,4 +606,180 @@ class BenchmarkResults:
                  writer.writeheader()
                  writer.writerows(csv_rows)
 
+        elif format == "sweep-csv":
+            output = self._generate_sweep_csv()
+            if filename:
+                with open(filename, "w", encoding="utf-8", newline="") as f:
+                    f.write(output)
+            else:
+                print(output, end="")
 
+        elif format in ("sweep-svg", "svg"):
+            output = self._generate_sweep_svg(sweep_title)
+            if filename:
+                with open(filename, "w", encoding="utf-8") as f:
+                    f.write(output)
+            else:
+                print(output, end="")
+
+
+def _derive_sweep_title(model_name: Optional[str]) -> str:
+    if not model_name:
+        return "llama-benchy sweep"
+    return f"{model_name} t/s"
+
+
+def _nice_ceil(value: float) -> float:
+    if value <= 0:
+        return 1.0
+    magnitude = float(10 ** math.floor(math.log10(value)))
+    normalized = value / magnitude
+    for step in (1.0, 2.0, 2.5, 3.0, 4.0, 5.0, 10.0):
+        if normalized <= step:
+            return step * magnitude
+    return 10.0 * magnitude
+
+
+def _nice_step(span: float, target_ticks: int) -> float:
+    if span <= 0:
+        return 1.0
+    raw = span / target_ticks
+    magnitude = float(10 ** math.floor(math.log10(raw)))
+    normalized = raw / magnitude
+    for step in (1.0, 2.0, 2.5, 5.0, 10.0):
+        if normalized <= step:
+            return step * magnitude
+    return 10.0 * magnitude
+
+
+def _frange(start: float, stop: float, step: float):
+    value = start
+    while value <= stop + step * 0.001:
+        yield round(value, 10)
+        value += step
+
+
+def _fmt_tick(value: float) -> str:
+    if abs(value) >= 1000:
+        return f"{value / 1000:g}k"
+    return f"{value:g}"
+
+
+def _project(point: Tuple[int, float], x_min: float, x_max: float, y_max: float, plot: Tuple[int, int, int, int]) -> str:
+    left, top, width, height = plot
+    x, y = point
+    x_span = max(1.0, x_max - x_min)
+    px = left + (x - x_min) / x_span * width
+    py = top + height - y / y_max * height
+    return f"{px:.2f},{py:.2f}"
+
+
+def _polyline(points: List[Tuple[int, float]], x_min: float, x_max: float, y_max: float, plot: Tuple[int, int, int, int]) -> str:
+    return " ".join(_project(point, x_min, x_max, y_max, plot) for point in points)
+
+
+def _render_empty_svg(title: str, width: int, height: int) -> str:
+    safe_title = html.escape(title)
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">\n'
+        '<rect width="100%" height="100%" fill="white"/>\n'
+        f'<text x="{width / 2:.0f}" y="{height / 2:.0f}" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" fill="#1f2933">{safe_title}: no sweep data</text>\n'
+        "</svg>\n"
+    )
+
+
+def _render_sweep_svg(rows: List[Dict[str, Any]], title: str, width: int, height: int) -> str:
+    margin_left = 82
+    margin_right = 92
+    margin_top = 66
+    margin_bottom = 72
+    plot = (
+        margin_left,
+        margin_top,
+        width - margin_left - margin_right,
+        height - margin_top - margin_bottom,
+    )
+    left, top, plot_width, plot_height = plot
+    right = left + plot_width
+    bottom = top + plot_height
+
+    groups: Dict[Tuple[int, int, int], List[Dict[str, Any]]] = {}
+    for row in rows:
+        key = (int(row["concurrency"]), int(row["prefill_tokens"]), int(row["gen_tokens"]))
+        groups.setdefault(key, []).append(row)
+
+    for group_rows in groups.values():
+        group_rows.sort(key=lambda row: int(row["ctx_tokens"]))
+
+    ctx_values = [int(row["ctx_tokens"]) for row in rows]
+    prefill_values = [float(row["prefill_tps"]) for row in rows]
+    gen_values = [float(row["gen_tps"]) for row in rows]
+
+    x_min = 0
+    x_max = max(ctx_values)
+    prefill_max = _nice_ceil(max(prefill_values) * 1.05)
+    gen_max = _nice_ceil(max(gen_values) * 1.05)
+
+    x_step = _nice_step(x_max - x_min, 6)
+    x_ticks = []
+    tick = math.ceil(x_min / x_step) * x_step
+    while tick <= x_max:
+        x_ticks.append(tick)
+        tick += x_step
+
+    prefill_step = _nice_step(prefill_max, 5)
+    gen_step = _nice_step(gen_max, 5)
+    prefill_ticks = list(_frange(0, prefill_max, prefill_step))
+    gen_ticks = list(_frange(0, gen_max, gen_step))
+
+    palette = ["#2563eb", "#dc2626", "#059669", "#d97706", "#7c3aed", "#0891b2", "#be123c", "#4b5563"]
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        f'<text x="{width / 2:.0f}" y="32" text-anchor="middle" font-family="Arial, sans-serif" font-size="22" font-weight="700" fill="#1f2933">{html.escape(title)}</text>',
+    ]
+
+    for tick in prefill_ticks:
+        y = bottom - tick / prefill_max * plot_height
+        parts.append(f'<line x1="{left}" y1="{y:.2f}" x2="{right}" y2="{y:.2f}" stroke="#e2e8f0" stroke-width="1"/>')
+        parts.append(f'<text x="{left - 10}" y="{y + 4:.2f}" text-anchor="end" font-family="Arial, sans-serif" font-size="12" fill="#64748b">{_fmt_tick(tick)}</text>')
+
+    for tick in gen_ticks:
+        y = bottom - tick / gen_max * plot_height
+        parts.append(f'<text x="{right + 10}" y="{y + 4:.2f}" text-anchor="start" font-family="Arial, sans-serif" font-size="12" fill="#64748b">{_fmt_tick(tick)}</text>')
+
+    for tick in x_ticks:
+        x = left + (tick - x_min) / max(1.0, x_max - x_min) * plot_width
+        parts.append(f'<line x1="{x:.2f}" y1="{top}" x2="{x:.2f}" y2="{bottom}" stroke="#eef2f7" stroke-width="1"/>')
+        parts.append(f'<text x="{x:.2f}" y="{bottom + 22}" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#64748b">{_fmt_tick(tick)}</text>')
+
+    parts.extend([
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{bottom}" stroke="#334155" stroke-width="1.5"/>',
+        f'<line x1="{right}" y1="{top}" x2="{right}" y2="{bottom}" stroke="#334155" stroke-width="1.5"/>',
+        f'<line x1="{left}" y1="{bottom}" x2="{right}" y2="{bottom}" stroke="#334155" stroke-width="1.5"/>',
+        f'<text x="{(left + right) / 2:.0f}" y="{height - 22}" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#1f2933">context depth tokens</text>',
+        f'<text transform="translate(22 {(top + bottom) / 2:.0f}) rotate(-90)" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#2563eb">prefill t/s total</text>',
+        f'<text transform="translate({width - 22} {(top + bottom) / 2:.0f}) rotate(90)" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#dc2626">generation t/s total</text>',
+    ])
+
+    legend_x = right - 210
+    legend_y = top + 18
+    line_idx = 0
+    for idx, (key, group_rows) in enumerate(sorted(groups.items())):
+        concurrency, prefill_tokens, gen_tokens = key
+        color = palette[idx % len(palette)]
+        label = f"c{concurrency} pp{prefill_tokens} tg{gen_tokens}"
+        prefill_points = [(int(row["ctx_tokens"]), float(row["prefill_tps"])) for row in group_rows]
+        gen_points = [(int(row["ctx_tokens"]), float(row["gen_tps"])) for row in group_rows]
+        parts.append(f'<polyline points="{_polyline(prefill_points, x_min, x_max, prefill_max, plot)}" fill="none" stroke="{color}" stroke-width="2.5"/>')
+        parts.append(f'<polyline points="{_polyline(gen_points, x_min, x_max, gen_max, plot)}" fill="none" stroke="{color}" stroke-width="2.5" stroke-dasharray="7 4"/>')
+        y = legend_y + line_idx * 20
+        parts.append(f'<line x1="{legend_x}" y1="{y}" x2="{legend_x + 22}" y2="{y}" stroke="{color}" stroke-width="2.5"/>')
+        parts.append(f'<line x1="{legend_x + 78}" y1="{y}" x2="{legend_x + 100}" y2="{y}" stroke="{color}" stroke-width="2.5" stroke-dasharray="7 4"/>')
+        parts.append(f'<text x="{legend_x + 28}" y="{y + 4}" font-family="Arial, sans-serif" font-size="12" fill="#1f2933">pp</text>')
+        parts.append(f'<text x="{legend_x + 106}" y="{y + 4}" font-family="Arial, sans-serif" font-size="12" fill="#1f2933">tg {html.escape(label)}</text>')
+        line_idx += 1
+
+    parts.append("</svg>")
+    return "\n".join(parts) + "\n"

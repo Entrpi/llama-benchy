@@ -49,6 +49,13 @@ class BenchmarkConfig(BaseModel):
     concurrency_levels: List[int] = Field(..., description="List of concurrency levels")
     save_result: Optional[str] = Field(None, description="File to save results to")
     result_format: str = Field("md", description="Output format (md, json, csv)")
+    sweep: bool = Field(False, description="Run a context-depth sweep")
+    sweep_start: int = Field(2048, description="First context depth for sweep mode")
+    sweep_max: int = Field(102400, description="Maximum context depth for sweep mode")
+    sweep_step: int = Field(2048, description="Context depth increment for sweep mode")
+    sweep_csv: Optional[str] = Field(None, description="File to save ds4-style sweep CSV to")
+    sweep_svg: Optional[str] = Field(None, description="File to save sweep SVG plot to")
+    sweep_title: Optional[str] = Field(None, description="Title for sweep SVG plot")
     save_total_throughput_timeseries: bool = Field(
         False,
         description="Save calculated TOTAL throughput for each 1 second window inside peak throughput calculation during the run.",
@@ -214,7 +221,7 @@ class BenchmarkConfig(BaseModel):
             "--depth",
             type=int,
             nargs="+",
-            default=[0],
+            default=None,
             help="List of context depths (previous conversation tokens) - default: 0",
         )
         parser.add_argument(
@@ -281,8 +288,49 @@ class BenchmarkConfig(BaseModel):
             "--format",
             type=str,
             default="md",
-            choices=["md", "json", "csv"],
+            choices=["md", "json", "csv", "sweep-csv", "sweep-svg", "svg"],
             help="Output format",
+        )
+        parser.add_argument(
+            "--sweep",
+            action="store_true",
+            help="Run a context-depth sweep. Defaults to 2k increments from 2k to 100k unless --depth is specified.",
+        )
+        parser.add_argument(
+            "--sweep-start",
+            type=int,
+            default=2048,
+            help="First context depth for --sweep - default: 2048",
+        )
+        parser.add_argument(
+            "--sweep-max",
+            type=int,
+            default=102400,
+            help="Maximum context depth for --sweep - default: 102400",
+        )
+        parser.add_argument(
+            "--sweep-step",
+            type=int,
+            default=2048,
+            help="Context depth increment for --sweep - default: 2048",
+        )
+        parser.add_argument(
+            "--sweep-csv",
+            type=str,
+            default=None,
+            help="File to save ds4-style sweep CSV to, in addition to --save-result if used",
+        )
+        parser.add_argument(
+            "--sweep-svg",
+            type=str,
+            default=None,
+            help="File to save sweep SVG plot to, in addition to --save-result if used",
+        )
+        parser.add_argument(
+            "--sweep-title",
+            type=str,
+            default=None,
+            help="Title for sweep SVG output",
         )
         parser.add_argument(
             "--save-total-throughput-timeseries",
@@ -309,6 +357,17 @@ class BenchmarkConfig(BaseModel):
 
         if args.no_results_on_fail:
             args.exit_on_first_fail = True
+
+        if args.sweep_step <= 0:
+            parser.error("--sweep-step must be greater than 0")
+        if args.sweep_max < args.sweep_start:
+            parser.error("--sweep-max must be greater than or equal to --sweep-start")
+
+        if args.depth is None:
+            if args.sweep:
+                args.depth = list(range(args.sweep_start, args.sweep_max + 1, args.sweep_step))
+            else:
+                args.depth = [0]
 
         # Auto-detect model if not specified
         if args.model is None:
@@ -354,6 +413,13 @@ class BenchmarkConfig(BaseModel):
             concurrency_levels=args.concurrency,
             save_result=args.save_result,
             result_format=args.format,
+            sweep=args.sweep,
+            sweep_start=args.sweep_start,
+            sweep_max=args.sweep_max,
+            sweep_step=args.sweep_step,
+            sweep_csv=args.sweep_csv,
+            sweep_svg=args.sweep_svg,
+            sweep_title=args.sweep_title,
             save_total_throughput_timeseries=args.save_total_throughput_timeseries,
             save_all_throughput_timeseries=args.save_all_throughput_timeseries,
             exit_on_first_fail=args.exit_on_first_fail,

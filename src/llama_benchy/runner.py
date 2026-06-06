@@ -191,7 +191,7 @@ class BenchmarkRunner:
                     max_concurrency=max(self.config.concurrency_levels) if self.config.concurrency_levels else 1
                 )
 
-            self.results.save_report(self.config.save_result, self.config.result_format, max(self.config.concurrency_levels) if self.config.concurrency_levels else 1)
+                self._save_results(max(self.config.concurrency_levels) if self.config.concurrency_levels else 1)
 
         except (asyncio.CancelledError, KeyboardInterrupt, BenchmarkFailure) as e:
             if self.results.runs:
@@ -212,8 +212,32 @@ class BenchmarkRunner:
                             prefix_caching_enabled=self.config.enable_prefix_caching,
                             max_concurrency=max_concurrency
                         )
-                    self.results.save_report(self.config.save_result, self.config.result_format, max_concurrency)
-            
+                    self._save_results(max_concurrency)
+
             if isinstance(e, BenchmarkFailure):
                 sys.exit(1)
             raise
+
+    def _save_results(self, max_concurrency: int):
+        self.results.save_report(
+            self.config.save_result,
+            self.config.result_format,
+            max_concurrency,
+            self.config.sweep_title,
+        )
+
+        if self.config.sweep_csv:
+            self.results.save_report(
+                self.config.sweep_csv,
+                "sweep-csv",
+                max_concurrency,
+                self.config.sweep_title,
+            )
+
+        if self.config.sweep_svg:
+            self.results.save_report(
+                self.config.sweep_svg,
+                "sweep-svg",
+                max_concurrency,
+                self.config.sweep_title,
+            )

@@ -31,6 +31,7 @@ As of January 2nd, 2026, I wasn't able to find any existing benchmarking tool th
 - Configurable latency measurement mode.
 - Supports concurrent requests (`--concurrency`) to measure throughput under load.
 - Can save results to file in Markdown, JSON, or CSV format.
+- Can run ds4-style context sweeps and export sweep CSV/SVG artifacts.
 - Can save granular time-series data for token generation when JSON output is used (`--save-total-throughput-timeseries` and `--save-all-throughput-timeseries`).
 - Runs a coherence test after warmup to verify model responds correctly (default, can be skipped with `--skip-coherence`).
 - Auto-detects HuggingFace model name from the endpoint's `/models` endpoint when `--model` is not specified.
@@ -175,7 +176,14 @@ Generally you don't need to disable prompt caching on the server, as a probabili
 -   `--enable-prefix-caching`: Enable prefix caching performance measurement. When enabled (and depth > 0), it performs a two-step benchmark: first loading the context (reported as `ctx_pp`), then running the prompt with the cached context.
 -   `--concurrency`: List of concurrency levels (number of concurrent requests per test) (Default: [1]).
 -   `--save-result`: File to save results to.
--   `--format`: Output format: 'md', 'json', 'csv' (Default: 'md').
+-   `--format`: Output format: 'md', 'json', 'csv', 'sweep-csv', 'sweep-svg', or 'svg' (Default: 'md').
+-   `--sweep`: Run a context-depth sweep. Defaults to 2k increments from 2k through 100k unless `--depth` is specified.
+-   `--sweep-start`: First context depth for `--sweep` (Default: 2048).
+-   `--sweep-max`: Maximum context depth for `--sweep` (Default: 102400).
+-   `--sweep-step`: Context depth increment for `--sweep` (Default: 2048).
+-   `--sweep-csv`: Save a ds4-style sweep CSV in addition to the normal report.
+-   `--sweep-svg`: Save a sweep SVG plot in addition to the normal report.
+-   `--sweep-title`: Title for sweep SVG output.
 -   `--save-total-throughput-timeseries`: Save calculated TOTAL throughput for each 1 second window inside peak throughput calculation during the run (default: off).
 -   `--save-all-throughput-timeseries`: Save calculated throughput timeseries for EACH individual request (default: off).
 -   `--exit-on-first-fail`: Stop execution on first failed test and exit with non-zero status.
@@ -294,6 +302,39 @@ This allows you to measure how the server scales and find the saturation point w
 
 Please note, that currently all batches run at the same time. If `--enable-prefix-caching` is used, then all prefill requests are executed simultaneously, followed by concurrent follow up requests.
 Other concurrency scenarios may be added in the future.
+
+### Context sweeps and SVG plots
+
+Use `--sweep` to run a ds4-style context-depth sweep. If you don't pass `--depth`, sweep mode tests every 2048-token context depth from 2048 through 102400.
+
+```bash
+llama-benchy \
+  --base-url http://spark:8888/v1 \
+  --model openai/gpt-oss-120b \
+  --sweep \
+  --tg 128 \
+  --latency-mode generation \
+  --sweep-csv sweep.csv \
+  --sweep-svg sweep.svg \
+  --sweep-title "gpt-oss-120b aggregate t/s"
+```
+
+The sweep CSV keeps the ds4-compatible columns `ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes` and adds concurrency-aware columns such as `concurrency`, `prefill_tps_req`, `gen_tps_req`, and peak generation throughput.
+
+To test aggregate throughput under load, pass multiple concurrency levels:
+
+```bash
+llama-benchy \
+  --base-url http://spark:8888/v1 \
+  --model openai/gpt-oss-120b \
+  --sweep \
+  --tg 128 \
+  --concurrency 1 2 4 \
+  --sweep-csv sweep_concurrency.csv \
+  --sweep-svg sweep_concurrency.svg
+```
+
+The SVG plots aggregate `prefill_tps` and `gen_tps` for each concurrency series. You can also print a single sweep artifact with `--format sweep-csv` or `--format sweep-svg`.
 
 **Example**
 
