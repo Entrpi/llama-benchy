@@ -202,3 +202,36 @@ async def test_mtp_integration(mock_server_url):
         f"MTP generation speed {gen_speed:.1f} t/s not within {tolerance*100:.0f}% of expected {expected_tps} t/s"
     )
 
+
+@pytest.mark.asyncio
+async def test_mtp_bench_prompt_suite(mock_server_url, tmp_path):
+    """
+    Verifies the mtp-bench prompt suite captures llama.cpp-style draft timing fields
+    from non-streaming chat completions.
+    """
+    out_path = tmp_path / "mtp-bench.json"
+    cmd = [
+        sys.executable, "-m", "llama_benchy",
+        "--base-url", mock_server_url,
+        "--model", "test-model-mtp3",
+        "--prompt-suite", "mtp-bench",
+        "--suite-max-tokens", "12",
+        "--save-result", str(out_path),
+        "--format", "json",
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print("STDOUT:", result.stdout)
+        print("STDERR:", result.stderr)
+        pytest.fail("llama-benchy mtp-bench command failed")
+
+    data = json.loads(out_path.read_text())
+    assert data["suite"] == "mtp-bench"
+    assert len(data["results"]) == 9
+    assert data["aggregate"]["n_requests"] == 9
+    assert data["aggregate"]["total_draft"] > 0
+    assert data["aggregate"]["total_draft_accepted"] > 0
+    assert data["aggregate"]["aggregate_accept_rate"] is not None
+    assert data["aggregate"]["aggregate_predicted_per_second"] > 0

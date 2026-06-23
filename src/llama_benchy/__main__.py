@@ -21,14 +21,19 @@ async def main_async():
     print(f"llama-benchy ({__version__})")
     print(f"Date: {current_time}")
     print(f"Benchmarking model: {config.model} at {config.base_url}")
-    print(f"Concurrency levels: {config.concurrency_levels}")
-
-    # 3. Prepare Data
-    corpus = TokenizedCorpus(config.book_url, config.tokenizer, config.model)
-    print(f"Total tokens available in text corpus: {len(corpus)}")
+    if config.prompt_suite:
+        print(f"Prompt suite: {config.prompt_suite}")
+    else:
+        print(f"Concurrency levels: {config.concurrency_levels}")
     
     # 4. Initialize Components
-    prompt_gen = PromptGenerator(corpus)
+    prompt_gen = None
+    if not config.prompt_suite:
+        # 3. Prepare Data
+        corpus = TokenizedCorpus(config.book_url, config.tokenizer, config.model)
+        print(f"Total tokens available in text corpus: {len(corpus)}")
+        prompt_gen = PromptGenerator(corpus)
+
     client = LLMClient(config.base_url, config.api_key, config.served_model_name)
     runner = BenchmarkRunner(config, client, prompt_gen)
     

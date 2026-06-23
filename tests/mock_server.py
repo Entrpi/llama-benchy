@@ -263,6 +263,10 @@ async def chat_completions(request: ChatCompletionRequest):
         await asyncio.sleep(num_completion_tokens * token_interval)
 
         response_text = COHERENCE_TEST_RESPONSE + " " if is_coherence_test else "mock " * num_completion_tokens
+        mtp_factor = get_mtp_factor(request.model)
+        draft_n = num_completion_tokens * mtp_factor if mtp_factor > 1 else 0
+        draft_n_accepted = num_completion_tokens * (mtp_factor - 1) if mtp_factor > 1 else 0
+        elapsed = max(time.perf_counter() - start_proc_time, 0.000001)
         
         return {
             "id": request_id,
@@ -283,7 +287,14 @@ async def chat_completions(request: ChatCompletionRequest):
                 "prompt_tokens": total_prompt_tokens,
                 "completion_tokens": num_completion_tokens,
                 "total_tokens": total_prompt_tokens + num_completion_tokens
-            }
+            },
+            "timings": {
+                "prompt_n": total_prompt_tokens,
+                "predicted_n": num_completion_tokens,
+                "predicted_per_second": num_completion_tokens / elapsed,
+                "draft_n": draft_n,
+                "draft_n_accepted": draft_n_accepted,
+            },
         }
 
 if __name__ == "__main__":

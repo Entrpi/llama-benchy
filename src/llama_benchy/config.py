@@ -72,6 +72,12 @@ class BenchmarkConfig(BaseModel):
         False,
         description="Prevent saving/printing results when error is experienced, turns on --exit-on-first-fail as well",
     )
+    prompt_suite: Optional[str] = Field(
+        None, description="Named prompt suite to run instead of synthetic pp/tg/depth benchmarks"
+    )
+    suite_max_tokens: int = Field(192, description="Maximum generated tokens per prompt-suite request")
+    suite_seed: Optional[int] = Field(42, description="Seed sent with prompt-suite requests")
+    suite_runs: int = Field(1, description="Number of prompt-suite passes")
 
     @staticmethod
     def _detect_hf_model_from_endpoint(base_url: str, api_key: str) -> Tuple[str, str]:
@@ -352,11 +358,42 @@ class BenchmarkConfig(BaseModel):
             action="store_true",
             help="Prevent saving/printing results when error is experienced, turns on --exit-on-first-fail as well",
         )
+        parser.add_argument(
+            "--prompt-suite",
+            type=str,
+            default=None,
+            choices=["mtp-bench"],
+            help="Run a named prompt suite instead of synthetic pp/tg/depth benchmarks",
+        )
+        parser.add_argument(
+            "--suite-max-tokens",
+            type=int,
+            default=192,
+            help="Maximum generated tokens per prompt-suite request - default: 192",
+        )
+        parser.add_argument(
+            "--suite-seed",
+            type=int,
+            default=42,
+            help="Seed sent with prompt-suite requests - default: 42",
+        )
+        parser.add_argument(
+            "--suite-runs",
+            type=int,
+            default=1,
+            help="Number of prompt-suite passes - default: 1",
+        )
 
         args = parser.parse_args()
 
         if args.no_results_on_fail:
             args.exit_on_first_fail = True
+        if args.suite_max_tokens <= 0:
+            parser.error("--suite-max-tokens must be greater than 0")
+        if args.suite_runs <= 0:
+            parser.error("--suite-runs must be greater than 0")
+        if args.prompt_suite and args.format not in ("md", "json", "csv"):
+            parser.error("--prompt-suite supports --format md, json, or csv")
 
         if args.sweep_step <= 0:
             parser.error("--sweep-step must be greater than 0")
@@ -424,4 +461,8 @@ class BenchmarkConfig(BaseModel):
             save_all_throughput_timeseries=args.save_all_throughput_timeseries,
             exit_on_first_fail=args.exit_on_first_fail,
             no_results_on_fail=args.no_results_on_fail,
+            prompt_suite=args.prompt_suite,
+            suite_max_tokens=args.suite_max_tokens,
+            suite_seed=args.suite_seed,
+            suite_runs=args.suite_runs,
         )

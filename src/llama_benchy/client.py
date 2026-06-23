@@ -20,6 +20,21 @@ class RequestResult:
     error: Optional[str] = None
     token_timestamps: List[float] = field(default_factory=list)
 
+@dataclass
+class PromptSuiteRequestResult:
+    name: str
+    run: int
+    start_ts: float = 0.0
+    end_ts: float = 0.0
+    wall_s: float = 0.0
+    prompt_tokens: int = 0
+    predicted_n: int = 0
+    predicted_per_second: float = 0.0
+    draft_n: int = 0
+    draft_n_accepted: int = 0
+    accept_rate: Optional[float] = None
+    error: Optional[str] = None
+
 class LLMClient:
     def __init__(self, base_url: str, api_key: str, model_name: str):
         self.base_url = base_url
@@ -192,6 +207,7 @@ class LLMClient:
             async with session.post(f"{self.base_url}/chat/completions", json=payload, headers=self.headers) as response:
                 if response.status != 200:
                     error_text = await response.text()
+                    result.end_ts = time.perf_counter()
                     result.error = f"HTTP {response.status}: {error_text}"
                     print(result.error)
                     return result
@@ -282,4 +298,63 @@ class LLMClient:
             print(f"Error during run: {e}")
             result.error = str(e)
         
+        return result
+
+    async def run_prompt_suite_generation(
+            self,
+            session: aiohttp.ClientSession,
+            name: str,
+            prompt: str,
+            max_tokens: int,
+            seed: Optional[int] = None,
+            run: int = 1,
+        ) -> PromptSuiteRequestResult:
+        result = PromptSuiteRequestResult(name=name, run=run)
+        payload: Dict[str, Any] = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+        }
+        if seed is not None:
+            payload["seed"] = seed
+
+        try:
+            result.start_ts = time.perf_counter()
+            async with session.post(f"{self.base_url}/chat/completions", json=payload, headers=self.headers) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    result.error = f"HTTP {response.status}: {error_text}"
+                    print(result.error)
+                    return result
+
+                response_json = await response.json()
+
+            result.end_ts = time.perf_counter()
+            result.wall_s = result.end_ts - result.start_ts
+
+            usage = response_json.get("usage", {}) or {}
+            timings = response_json.get("timings", {}) or {}
+
+            result.prompt_tokens = int(usage.get("prompt_tokens") or timings.get("prompt_n") or 0)
+            result.predicted_n = int(
+                usage.get("completion_tokens")
+                or timings.get("predicted_n")
+                or 0
+            )
+            result.predicted_per_second = float(
+                timings.get("predicted_per_second")
+                or (result.predicted_n / result.wall_s if result.wall_s > 0 else 0.0)
+            )
+            result.draft_n = int(timings.get("draft_n") or 0)
+            result.draft_n_accepted = int(timings.get("draft_n_accepted") or 0)
+            if result.draft_n:
+                result.accept_rate = result.draft_n_accepted / result.draft_n
+
+        except Exception as e:
+            print(f"Error during prompt suite run: {e}")
+            result.error = str(e)
+            if result.start_ts:
+                result.end_ts = time.perf_counter()
+                result.wall_s = result.end_ts - result.start_ts
+
         return result

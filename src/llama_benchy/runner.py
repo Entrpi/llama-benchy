@@ -3,20 +3,20 @@ import subprocess
 import time
 import sys
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 import aiohttp
 
 from ._version import __version__
 from .config import BenchmarkConfig
 from .client import LLMClient
-from .prompts import PromptGenerator
-from .results import BenchmarkResults, BenchmarkMetadata
+from .prompts import PROMPT_SUITES, PromptGenerator
+from .results import BenchmarkResults, BenchmarkMetadata, PromptSuiteResults
 
 class BenchmarkFailure(Exception):
     pass
 
 class BenchmarkRunner:
-    def __init__(self, config: BenchmarkConfig, client: LLMClient, prompt_generator: PromptGenerator):
+    def __init__(self, config: BenchmarkConfig, client: LLMClient, prompt_generator: Optional[PromptGenerator]):
         self.config = config
         self.client = client
         self.prompt_gen = prompt_generator
@@ -27,6 +27,14 @@ class BenchmarkRunner:
         self.delta_context = 0
 
     async def run_suite(self):
+        if self.config.prompt_suite:
+            await self.run_prompt_suite()
+            return
+
+        prompt_gen = self.prompt_gen
+        if prompt_gen is None:
+            raise RuntimeError("Prompt generator is required for synthetic benchmark runs")
+
         # Initialize session
         timeout = aiohttp.ClientTimeout(total=3600)
         max_concurrency = max(self.config.concurrency_levels)
@@ -40,7 +48,7 @@ class BenchmarkRunner:
                 if self.config.adapt_prompt:
                     should_warmup = True
 
-                tokenizer = self.prompt_gen.corpus.get_tokenizer()
+                tokenizer = prompt_gen.corpus.get_tokenizer()
 
                 if should_warmup:
                     self.delta_user, self.delta_context = await self.client.warmup(session, tokenizer)
@@ -85,7 +93,7 @@ class BenchmarkRunner:
                                     expected_pp = current_pp
                                     expected_ctx = current_depth
 
-                                    prompt_batch = self.prompt_gen.generate_batch(
+                                    prompt_batch = prompt_gen.generate_batch(
                                         concurrency,
                                         current_pp,
                                         current_depth,
@@ -217,6 +225,55 @@ class BenchmarkRunner:
             if isinstance(e, BenchmarkFailure):
                 sys.exit(1)
             raise
+
+    async def run_prompt_suite(self):
+        prompts = PROMPT_SUITES.get(self.config.prompt_suite or "")
+        if prompts is None:
+            raise ValueError(f"Unknown prompt suite: {self.config.prompt_suite}")
+
+        timeout = aiohttp.ClientTimeout(total=3600)
+        connector = aiohttp.TCPConnector(limit=2, force_close=False, keepalive_timeout=600)
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+        suite_results = PromptSuiteResults(
+            suite_name=self.config.prompt_suite or "",
+            model_name=self.config.model,
+            max_tokens=self.config.suite_max_tokens,
+            seed=self.config.suite_seed,
+            version=__version__,
+            timestamp=timestamp,
+        )
+
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector, trust_env=True) as session:
+            for run in range(1, self.config.suite_runs + 1):
+                for prompt in prompts:
+                    print(f"Running prompt suite: {self.config.prompt_suite} run={run} prompt={prompt['name']}")
+                    result = await self.client.run_prompt_suite_generation(
+                        session,
+                        name=prompt["name"],
+                        prompt=prompt["prompt"],
+                        max_tokens=self.config.suite_max_tokens,
+                        seed=self.config.suite_seed,
+                        run=run,
+                    )
+                    suite_results.add(result)
+                    if result.error:
+                        if self.config.exit_on_first_fail:
+                            break
+                        continue
+
+                    accept_rate = f"{result.accept_rate:.3f}" if result.accept_rate is not None else "n/a"
+                    print(
+                        f"  {result.name:<18} pred={result.predicted_n:>4} "
+                        f"draft={result.draft_n:>4} acc={result.draft_n_accepted:>4} "
+                        f"rate={accept_rate} tok/s={result.predicted_per_second:.1f}"
+                    )
+                if self.config.exit_on_first_fail and any(result.error for result in suite_results.results):
+                    break
+
+        suite_results.save_report(self.config.save_result, self.config.result_format)
+
+        if self.config.exit_on_first_fail and any(result.error for result in suite_results.results):
+            raise BenchmarkFailure()
 
     def _save_results(self, max_concurrency: int):
         self.results.save_report(

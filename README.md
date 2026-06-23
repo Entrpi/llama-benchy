@@ -188,6 +188,10 @@ Generally you don't need to disable prompt caching on the server, as a probabili
 -   `--save-all-throughput-timeseries`: Save calculated throughput timeseries for EACH individual request (default: off).
 -   `--exit-on-first-fail`: Stop execution on first failed test and exit with non-zero status.
 -   `--no-results-on-fail`: Prevent saving/printing any results when error is experienced, turns on --exit-on-first-fail as well.
+-   `--prompt-suite`: Run a named prompt suite instead of synthetic `--pp`/`--tg`/`--depth` benchmarks. Currently supports `mtp-bench`.
+-   `--suite-max-tokens`: Maximum generated tokens per prompt-suite request (Default: 192).
+-   `--suite-seed`: Seed sent with prompt-suite requests (Default: 42).
+-   `--suite-runs`: Number of prompt-suite passes (Default: 1).
 
 ### Metrics
 
@@ -335,6 +339,24 @@ llama-benchy \
 ```
 
 The SVG plots aggregate `prefill_tps` and `gen_tps` for each concurrency series. You can also print a single sweep artifact with `--format sweep-csv` or `--format sweep-svg`.
+
+### MTP bench prompt suite
+
+Use `--prompt-suite mtp-bench` to run the 9 natural prompts from the llama.cpp MTP benchmark suite. This mode uses non-streaming chat completions so llama.cpp timing fields such as `draft_n` and `draft_n_accepted` are preserved in the report.
+
+```bash
+llama-benchy \
+  --base-url http://localhost:8080/v1 \
+  --model unsloth/gemma-4-26B-A4B-it \
+  --served-model-name llama \
+  --prompt-suite mtp-bench \
+  --suite-max-tokens 192 \
+  --suite-seed 42 \
+  --save-result mtp-bench.json \
+  --format json
+```
+
+The JSON and CSV reports include per-prompt wall time, generated tokens/sec, draft tokens, accepted draft tokens, and acceptance rate. This suite does not launch or configure MTP itself; start the server with the drafter and `--spec-draft-n-max` variant you want to test, then run the suite against that endpoint.
 
 **Example**
 

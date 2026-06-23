@@ -9,7 +9,7 @@ import io
 import math
 import sys
 
-from .client import RequestResult
+from .client import PromptSuiteRequestResult, RequestResult
 
 # Type alias for a time series: List of [timestamp, value] pairs
 TimeSeries = List[List[float]]
@@ -60,6 +60,166 @@ class BenchmarkRun(BaseModel):
 
 class BenchmarkReport(BenchmarkMetadata):
     benchmarks: List[BenchmarkRun] = Field(..., description="List of benchmark run results")
+
+class PromptSuiteResults:
+    def __init__(
+        self,
+        suite_name: str,
+        model_name: str,
+        max_tokens: int,
+        seed: Optional[int],
+        version: str,
+        timestamp: str,
+    ):
+        self.suite_name = suite_name
+        self.model_name = model_name
+        self.max_tokens = max_tokens
+        self.seed = seed
+        self.version = version
+        self.timestamp = timestamp
+        self.results: List[PromptSuiteRequestResult] = []
+
+    def add(self, result: PromptSuiteRequestResult):
+        self.results.append(result)
+
+    def aggregate(self) -> Dict[str, Any]:
+        valid = [result for result in self.results if not result.error]
+        total_predicted = sum(result.predicted_n for result in valid)
+        total_draft = sum(result.draft_n for result in valid)
+        total_draft_accepted = sum(result.draft_n_accepted for result in valid)
+        wall_s_total = sum(result.wall_s for result in valid)
+        return {
+            "n_requests": len(valid),
+            "n_errors": len(self.results) - len(valid),
+            "total_predicted": total_predicted,
+            "total_draft": total_draft,
+            "total_draft_accepted": total_draft_accepted,
+            "aggregate_accept_rate": (
+                round(total_draft_accepted / total_draft, 4) if total_draft else None
+            ),
+            "wall_s_total": round(wall_s_total, 3),
+            "aggregate_predicted_per_second": (
+                round(total_predicted / wall_s_total, 3) if wall_s_total > 0 else 0.0
+            ),
+        }
+
+    def rows(self) -> List[Dict[str, Any]]:
+        rows = []
+        for result in self.results:
+            rows.append({
+                "suite": self.suite_name,
+                "model": self.model_name,
+                "run": result.run,
+                "name": result.name,
+                "wall_s": round(result.wall_s, 3),
+                "prompt_tokens": result.prompt_tokens,
+                "predicted_n": result.predicted_n,
+                "predicted_per_second": round(result.predicted_per_second, 3),
+                "draft_n": result.draft_n,
+                "draft_n_accepted": result.draft_n_accepted,
+                "accept_rate": round(result.accept_rate, 4) if result.accept_rate is not None else None,
+                "error": result.error,
+            })
+        return rows
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "version": self.version,
+            "timestamp": self.timestamp,
+            "suite": self.suite_name,
+            "model": self.model_name,
+            "max_tokens": self.max_tokens,
+            "seed": self.seed,
+            "results": self.rows(),
+            "aggregate": self.aggregate(),
+        }
+
+    def _generate_md_report(self) -> str:
+        rows = self.rows()
+        if not rows:
+            return "No prompt-suite results collected."
+
+        data = [
+            [
+                row["run"],
+                row["name"],
+                row["predicted_n"],
+                f'{row["wall_s"]:.3f}',
+                f'{row["predicted_per_second"]:.2f}',
+                row["draft_n"],
+                row["draft_n_accepted"],
+                f'{row["accept_rate"]:.3f}' if row["accept_rate"] is not None else "",
+                row["error"] or "",
+            ]
+            for row in rows
+        ]
+        aggregate = self.aggregate()
+        table = tabulate(
+            data,
+            headers=[
+                "run",
+                "prompt",
+                "pred",
+                "wall_s",
+                "tok/s",
+                "draft",
+                "accepted",
+                "accept",
+                "error",
+            ],
+            tablefmt="pipe",
+        )
+        summary = (
+            f"\nAggregate: {aggregate['aggregate_predicted_per_second']:.2f} tok/s, "
+            f"wall={aggregate['wall_s_total']:.3f}s, "
+            f"accept={aggregate['aggregate_accept_rate'] if aggregate['aggregate_accept_rate'] is not None else 'n/a'}"
+        )
+        return table + summary
+
+    def _generate_csv(self) -> str:
+        rows = self.rows()
+        if not rows:
+            return ""
+        headers = [
+            "suite",
+            "model",
+            "run",
+            "name",
+            "wall_s",
+            "prompt_tokens",
+            "predicted_n",
+            "predicted_per_second",
+            "draft_n",
+            "draft_n_accepted",
+            "accept_rate",
+            "error",
+        ]
+        fp = io.StringIO()
+        writer = csv.DictWriter(fp, fieldnames=headers, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+        return fp.getvalue()
+
+    def save_report(self, filename: Optional[str], format: str):
+        print(
+            f"{'Saving' if filename else 'Printing'} prompt-suite results"
+            f"{f' to {filename}' if filename else ''} in {format.upper()} format...\n"
+        )
+
+        if format == "json":
+            output = json.dumps(self.to_dict(), indent=2)
+        elif format == "csv":
+            output = self._generate_csv()
+        elif format == "md":
+            output = self._generate_md_report()
+        else:
+            raise ValueError(f"Unsupported prompt-suite output format: {format}")
+
+        if filename:
+            with open(filename, "w", encoding="utf-8", newline="" if format == "csv" else None) as f:
+                f.write(output)
+        else:
+            print(output)
 
 class BenchmarkResults:
     def __init__(self):
