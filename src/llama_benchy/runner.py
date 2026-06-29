@@ -130,8 +130,8 @@ class BenchmarkRunner:
                                         load_tasks = []
                                         for i in range(concurrency):
                                             context, _ = prompt_batch[i]
-                                            rid = self._new_request_id()
                                             if not is_warmup:
+                                                rid = self._new_request_id()
                                                 self._emit_request_start(rid, pp, tg, depth, concurrency, run)
                                             load_tasks.append(self.client.run_generation(
                                                 session,
@@ -158,8 +158,8 @@ class BenchmarkRunner:
                                         inf_tasks = []
                                         for i in range(concurrency):
                                             context, prompt = prompt_batch[i]
-                                            rid = self._new_request_id()
                                             if not is_warmup:
+                                                rid = self._new_request_id()
                                                 self._emit_request_start(rid, pp, tg, depth, concurrency, run)
                                             inf_tasks.append(self.client.run_generation(
                                                 session,
@@ -188,8 +188,8 @@ class BenchmarkRunner:
                                         batch_tasks = []
                                         for i in range(concurrency):
                                             context, prompt = prompt_batch[i]
-                                            rid = self._new_request_id()
                                             if not is_warmup:
+                                                rid = self._new_request_id()
                                                 self._emit_request_start(rid, pp, tg, depth, concurrency, run)
                                             batch_tasks.append(self.client.run_generation(
                                                 session,
