@@ -377,12 +377,14 @@ class LLMClient:
                                             # Best-effort per-chunk count for the live stream.
                                             # The authoritative total is reconciled in
                                             # _finalize_stream_tokens and reported by request_end.
-                                            chunk_count = len(token_ids) if isinstance(token_ids, list) else 1
+                                            has_token_ids = isinstance(token_ids, list)
+                                            chunk_count = len(token_ids) if has_token_ids else 1
                                             try:
                                                 progress.tokens(
                                                     request_id=request_id,
                                                     count=chunk_count,
                                                     snippet=text or "",
+                                                    estimated=not has_token_ids,
                                                 )
                                             except Exception:
                                                 pass

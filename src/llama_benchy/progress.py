@@ -96,10 +96,13 @@ class ProgressEmitter:
         """Network latency probe complete (used to derive est_ppt = ttfr − latency)."""
         self._emit("latency_measured", latency_s=latency_s, mode=mode)
 
-    def tokens(self, *, request_id: int, count: int, snippet: str = "") -> None:
+    def tokens(self, *, request_id: int, count: int, snippet: str = "", estimated: bool = False) -> None:
         if count <= 0 and not snippet:
             return
-        self._emit("tokens", request_id=request_id, count=count, snippet=snippet)
+        fields = {"request_id": request_id, "count": count, "snippet": snippet}
+        if estimated:
+            fields["estimated"] = True
+        self._emit("tokens", **fields)
 
     def request_end(
         self,

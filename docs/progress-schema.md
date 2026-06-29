@@ -109,6 +109,7 @@ between `request_first_token` and `request_end`.
 | `request_id` | integer | Matches the request's `request_start`.                 |
 | `count`      | integer | Number of generated tokens in this chunk (≥ 1).        |
 | `snippet`    | string  | Decoded text for this chunk (may be empty).            |
+| `estimated`  | boolean | Optional. Present and `true` when the server did not return `token_ids` and `count` is a best-effort estimate (one-per-chunk fallback). Absent otherwise. The authoritative total is reported on `request_end`. |
 
 A single `tokens` event may carry multiple tokens when the server streams
 multi-token chunks (e.g. speculative decoding / MTP). Consumers computing
