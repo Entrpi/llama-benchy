@@ -214,7 +214,10 @@ class LLMClient:
 
                 decoder = codecs.getincrementaldecoder("utf-8")(errors='replace')
                 buffer = ""
-                
+                usage_completion_tokens = 0
+                fallback_texts = []
+                saw_token_ids = False
+
                 async for chunk_bytes in response.content.iter_any():
                     chunk_time = time.perf_counter()
                     decoded_chunk = decoder.decode(chunk_bytes, final=False)
@@ -236,6 +239,7 @@ class LLMClient:
 
                                 if 'usage' in chunk and chunk['usage'] is not None:
                                     result.prompt_tokens = chunk['usage'].get('prompt_tokens', 0)
+                                    usage_completion_tokens = chunk['usage'].get('completion_tokens', 0) or usage_completion_tokens
                                 
                                 if 'choices' in chunk and len(chunk['choices']) > 0:
                                     if result.first_response_ts is None:
@@ -252,6 +256,7 @@ class LLMClient:
                                         
                                         token_ids = chunk['choices'][0].get('token_ids')
                                         if token_ids and isinstance(token_ids, list):
+                                            saw_token_ids = True
                                             result.total_tokens += len(token_ids)
                                             if len(token_ids) == 1:
                                                 result.token_timestamps.append(chunk_time)
@@ -270,6 +275,7 @@ class LLMClient:
                                                 _warned_about_fallback = True
                                             
                                             full_content = content or reasoning_content or reasoning
+                                            fallback_texts.append(full_content)
                                             token_count = len(tokenizer.encode(full_content, add_special_tokens=False))
                                             result.total_tokens += token_count
                                             if token_count == 1:
@@ -293,6 +299,16 @@ class LLMClient:
                                 continue
             
             result.end_ts = time.perf_counter()
+
+            # Per-fragment retokenization over-counts (merges across delta boundaries
+            # are lost — measured 1.94x on real thinking output). Precedence:
+            # per-delta token_ids (exact) > server usage count > retokenize the
+            # JOINED text. Never per-fragment counting for the total.
+            if not saw_token_ids:
+                if usage_completion_tokens > 0:
+                    result.total_tokens = usage_completion_tokens
+                elif fallback_texts and tokenizer is not None:
+                    result.total_tokens = len(tokenizer.encode("".join(fallback_texts), add_special_tokens=False))
 
         except Exception as e:
             print(f"Error during run: {e}")
