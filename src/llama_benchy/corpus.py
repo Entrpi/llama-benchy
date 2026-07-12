@@ -1,22 +1,72 @@
 import os
 import hashlib
 import requests
-from transformers import AutoTokenizer
+from typing import Any, Optional
+
+
+class LightweightTokenizer:
+    def __init__(self, tokenizer: Any):
+        self._tokenizer = tokenizer
+
+    @classmethod
+    def from_pretrained(cls, name: str) -> "LightweightTokenizer":
+        from tokenizers import Tokenizer
+
+        if os.path.isfile(name):
+            tokenizer = Tokenizer.from_file(name)
+        else:
+            tokenizer_json = os.path.join(name, "tokenizer.json")
+            if os.path.isdir(name) and os.path.exists(tokenizer_json):
+                tokenizer = Tokenizer.from_file(tokenizer_json)
+            else:
+                tokenizer = Tokenizer.from_pretrained(name)
+        return cls(tokenizer)
+
+    def encode(self, text: str, add_special_tokens: bool = False):
+        return self._tokenizer.encode(
+            text, add_special_tokens=add_special_tokens
+        ).ids
+
+    def decode(self, token_ids):
+        return self._tokenizer.decode(list(token_ids), skip_special_tokens=False)
+
 
 class TokenizedCorpus:
-    def __init__(self, book_url: str, tokenizer_name: str, model_name: str):
+    def __init__(self, book_url: str, tokenizer_name: Optional[str], model_name: str):
         self.book_url = book_url
         self.tokenizer = self._get_tokenizer(model_name, tokenizer_name)
         self.tokens = self._load_data()
 
-    def _get_tokenizer(self, model_name, tokenizer_name=None):
+    def _get_transformers_tokenizer(self, name: str):
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(
+            name,
+            use_fast=True,
+            trust_remote_code=False,
+        )
+
+    def _get_tokenizer(self, model_name: str, tokenizer_name: Optional[str] = None):
+        name = tokenizer_name if tokenizer_name else model_name
+        lightweight_error = None
+
         try:
-            name = tokenizer_name if tokenizer_name else model_name
-            return AutoTokenizer.from_pretrained(name)
+            return LightweightTokenizer.from_pretrained(name)
         except Exception as e:
-            print(f"Error loading tokenizer: {e}")
+            lightweight_error = e
+
+        try:
+            return self._get_transformers_tokenizer(name)
+        except Exception as e:
+            print(
+                f"Error loading tokenizer '{name}': {e} "
+                f"(lightweight tokenizer error: {lightweight_error})"
+            )
             print("Falling back to 'gpt2' tokenizer as approximation.")
-            return AutoTokenizer.from_pretrained("gpt2")
+            try:
+                return LightweightTokenizer.from_pretrained("gpt2")
+            except Exception:
+                return self._get_transformers_tokenizer("gpt2")
 
     def _load_data(self):
         try:

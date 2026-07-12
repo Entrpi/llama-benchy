@@ -286,6 +286,7 @@ async def test_mtp_bench_prompt_suite(mock_server_url, tmp_path):
     from non-streaming chat completions.
     """
     out_path = tmp_path / "mtp-bench.json"
+    progress_path = tmp_path / "mtp-bench-progress.jsonl"
     cmd = [
         sys.executable, "-m", "llama_benchy",
         "--base-url", mock_server_url,
@@ -294,6 +295,7 @@ async def test_mtp_bench_prompt_suite(mock_server_url, tmp_path):
         "--suite-max-tokens", "12",
         "--save-result", str(out_path),
         "--format", "json",
+        "--emit-progress", str(progress_path),
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -311,3 +313,30 @@ async def test_mtp_bench_prompt_suite(mock_server_url, tmp_path):
     assert data["aggregate"]["total_draft_accepted"] > 0
     assert data["aggregate"]["aggregate_accept_rate"] is not None
     assert data["aggregate"]["aggregate_predicted_per_second"] > 0
+
+    progress_events = [
+        json.loads(line) for line in progress_path.read_text().splitlines()
+    ]
+    start_events = [
+        event for event in progress_events if event["type"] == "request_start"
+    ]
+    end_events = [
+        event for event in progress_events if event["type"] == "request_end"
+    ]
+
+    assert len(start_events) == 9
+    assert len(end_events) == 9
+    assert [event["request_id"] for event in start_events] == list(range(9))
+    assert [event["request_id"] for event in end_events] == list(range(9))
+    assert start_events[0]["target_label"] == "code_python"
+    assert start_events[0]["prompt_size"] == 0
+    assert start_events[0]["response_size"] == 12
+    assert all(event["prompt_tokens"] > 0 for event in end_events)
+    assert all(event["total_tokens"] == 12 for event in end_events)
+    assert all(event["decode_seconds"] == 0.0 for event in end_events)
+    assert not any(
+        event["type"] in {"request_first_response", "request_first_token", "tokens"}
+        for event in progress_events
+    )
+    assert progress_events[-1]["type"] == "bench_complete"
+    assert progress_events[-1]["status"] == "ok"

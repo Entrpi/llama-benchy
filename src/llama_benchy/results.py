@@ -227,13 +227,20 @@ class BenchmarkResults:
         self.metadata: Optional[BenchmarkMetadata] = None
         self.model_name: Optional[str] = None
 
+    def _count_tokens_after_first_timestamp(self, timestamps: List[float]) -> int:
+        if len(timestamps) < 2:
+            return 0
+
+        first_ts = timestamps[0]
+        return sum(1 for ts in timestamps if ts > first_ts)
+
     def _calculate_metric(self, values: List[float], multiplier: float = 1.0) -> Optional[BenchmarkMetric]:
         if not values:
             return None
         scaled_values = [v * multiplier for v in values]
         return BenchmarkMetric(
-            mean=np.mean(values) * multiplier,
-            std=np.std(values) * multiplier,
+            mean=float(np.mean(values)) * multiplier,
+            std=float(np.std(values)) * multiplier,
             values=scaled_values
         )
 
@@ -470,10 +477,11 @@ class BenchmarkResults:
                 pp_speed = prompt_tokens / est_ppt
                 agg_pp_speeds.append(pp_speed)
             
-            if res.total_tokens > 1 and res.first_token_ts:
-                decode_time = res.end_ts - res.first_token_ts
-                if decode_time > 0:
-                    tg_speed = (res.total_tokens - 1) / decode_time
+            if res.total_tokens > 1 and len(res.token_timestamps) > 1:
+                decode_time = res.token_timestamps[-1] - res.token_timestamps[0]
+                decode_tokens = self._count_tokens_after_first_timestamp(res.token_timestamps)
+                if decode_time > 0 and decode_tokens > 0:
+                    tg_speed = decode_tokens / decode_time
                     agg_tg_speeds.append(tg_speed)
         
         if save_all_throughput_timeseries and agg_req_throughput_series is not None:
@@ -499,9 +507,13 @@ class BenchmarkResults:
             tg_duration = max_last_token - min_first_token
             
             if tg_duration > 0:
-                if batch_gen_tokens > len(valid_results):
-                     batch_tg_throughput = (batch_gen_tokens - len(valid_results)) / tg_duration
-                     agg_batch_tg_throughputs.append(batch_tg_throughput)
+                observed_decode_tokens = sum(
+                    self._count_tokens_after_first_timestamp(r.token_timestamps)
+                    for r in valid_results
+                )
+                if observed_decode_tokens > 0:
+                    batch_tg_throughput = observed_decode_tokens / tg_duration
+                    agg_batch_tg_throughputs.append(batch_tg_throughput)
 
         if all_token_timestamps:
             res = self._calculate_peak_throughput(all_token_timestamps, return_series=save_total_throughput_timeseries)
@@ -518,7 +530,7 @@ class BenchmarkResults:
         for run in self.runs:
             if run.is_context_prefill_phase:
                 continue
-            if not run.pp_throughput or not run.tg_throughput:
+            if not run.pp_throughput:
                 continue
 
             rows.append({
@@ -526,7 +538,7 @@ class BenchmarkResults:
                 "prefill_tokens": run.prompt_size,
                 "prefill_tps": run.pp_throughput.mean,
                 "gen_tokens": run.response_size,
-                "gen_tps": run.tg_throughput.mean,
+                "gen_tps": run.tg_throughput.mean if run.tg_throughput else "",
                 "kvcache_bytes": "",
                 "concurrency": run.concurrency,
                 "prefill_tps_req": run.pp_req_throughput.mean if run.pp_req_throughput else "",
@@ -612,7 +624,7 @@ class BenchmarkResults:
                     })
                 
                 # Context Phase Token Generation
-                if run.tg_throughput:
+                if run.tg_throughput or run.peak_throughput:
                     rows.append({
                         "model": self.model_name or "Unknown",
                         "test_name": f"ctx_tg @ d{run.context_size}{c_suffix}",
@@ -643,7 +655,7 @@ class BenchmarkResults:
                     })
                 
                 # Token Generation
-                if run.tg_throughput:
+                if run.tg_throughput or run.peak_throughput:
                     rows.append({
                         "model": self.model_name or "Unknown",
                         "test_name": f"tg{run.response_size}{d_suffix}{c_suffix}",
@@ -765,7 +777,6 @@ class BenchmarkResults:
                  writer = csv.DictWriter(sys.stdout, fieldnames=headers)
                  writer.writeheader()
                  writer.writerows(csv_rows)
-
         elif format == "sweep-csv":
             output = self._generate_sweep_csv()
             if filename:
@@ -873,12 +884,16 @@ def _render_sweep_svg(rows: List[Dict[str, Any]], title: str, width: int, height
 
     ctx_values = [int(row["ctx_tokens"]) for row in rows]
     prefill_values = [float(row["prefill_tps"]) for row in rows]
-    gen_values = [float(row["gen_tps"]) for row in rows]
+    gen_values = [
+        float(row["gen_tps"])
+        for row in rows
+        if row["gen_tps"] != ""
+    ]
 
     x_min = 0
     x_max = max(ctx_values)
     prefill_max = _nice_ceil(max(prefill_values) * 1.05)
-    gen_max = _nice_ceil(max(gen_values) * 1.05)
+    gen_max = _nice_ceil(max(gen_values) * 1.05) if gen_values else 1.0
 
     x_step = _nice_step(x_max - x_min, 6)
     x_ticks = []
@@ -890,7 +905,7 @@ def _render_sweep_svg(rows: List[Dict[str, Any]], title: str, width: int, height
     prefill_step = _nice_step(prefill_max, 5)
     gen_step = _nice_step(gen_max, 5)
     prefill_ticks = list(_frange(0, prefill_max, prefill_step))
-    gen_ticks = list(_frange(0, gen_max, gen_step))
+    gen_ticks = list(_frange(0, gen_max, gen_step)) if gen_values else []
 
     palette = ["#2563eb", "#dc2626", "#059669", "#d97706", "#7c3aed", "#0891b2", "#be123c", "#4b5563"]
 
@@ -916,12 +931,15 @@ def _render_sweep_svg(rows: List[Dict[str, Any]], title: str, width: int, height
 
     parts.extend([
         f'<line x1="{left}" y1="{top}" x2="{left}" y2="{bottom}" stroke="#334155" stroke-width="1.5"/>',
-        f'<line x1="{right}" y1="{top}" x2="{right}" y2="{bottom}" stroke="#334155" stroke-width="1.5"/>',
         f'<line x1="{left}" y1="{bottom}" x2="{right}" y2="{bottom}" stroke="#334155" stroke-width="1.5"/>',
         f'<text x="{(left + right) / 2:.0f}" y="{height - 22}" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#1f2933">context depth tokens</text>',
         f'<text transform="translate(22 {(top + bottom) / 2:.0f}) rotate(-90)" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#2563eb">prefill t/s total</text>',
-        f'<text transform="translate({width - 22} {(top + bottom) / 2:.0f}) rotate(90)" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#dc2626">generation t/s total</text>',
     ])
+    if gen_values:
+        parts.extend([
+            f'<line x1="{right}" y1="{top}" x2="{right}" y2="{bottom}" stroke="#334155" stroke-width="1.5"/>',
+            f'<text transform="translate({width - 22} {(top + bottom) / 2:.0f}) rotate(90)" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#dc2626">generation t/s total</text>',
+        ])
 
     legend_x = right - 210
     legend_y = top + 18
@@ -931,14 +949,22 @@ def _render_sweep_svg(rows: List[Dict[str, Any]], title: str, width: int, height
         color = palette[idx % len(palette)]
         label = f"c{concurrency} pp{prefill_tokens} tg{gen_tokens}"
         prefill_points = [(int(row["ctx_tokens"]), float(row["prefill_tps"])) for row in group_rows]
-        gen_points = [(int(row["ctx_tokens"]), float(row["gen_tps"])) for row in group_rows]
+        gen_points = [
+            (int(row["ctx_tokens"]), float(row["gen_tps"]))
+            for row in group_rows
+            if row["gen_tps"] != ""
+        ]
         parts.append(f'<polyline points="{_polyline(prefill_points, x_min, x_max, prefill_max, plot)}" fill="none" stroke="{color}" stroke-width="2.5"/>')
-        parts.append(f'<polyline points="{_polyline(gen_points, x_min, x_max, gen_max, plot)}" fill="none" stroke="{color}" stroke-width="2.5" stroke-dasharray="7 4"/>')
+        if gen_points:
+            parts.append(f'<polyline points="{_polyline(gen_points, x_min, x_max, gen_max, plot)}" fill="none" stroke="{color}" stroke-width="2.5" stroke-dasharray="7 4"/>')
         y = legend_y + line_idx * 20
         parts.append(f'<line x1="{legend_x}" y1="{y}" x2="{legend_x + 22}" y2="{y}" stroke="{color}" stroke-width="2.5"/>')
-        parts.append(f'<line x1="{legend_x + 78}" y1="{y}" x2="{legend_x + 100}" y2="{y}" stroke="{color}" stroke-width="2.5" stroke-dasharray="7 4"/>')
-        parts.append(f'<text x="{legend_x + 28}" y="{y + 4}" font-family="Arial, sans-serif" font-size="12" fill="#1f2933">pp</text>')
-        parts.append(f'<text x="{legend_x + 106}" y="{y + 4}" font-family="Arial, sans-serif" font-size="12" fill="#1f2933">tg {html.escape(label)}</text>')
+        if gen_points:
+            parts.append(f'<line x1="{legend_x + 78}" y1="{y}" x2="{legend_x + 100}" y2="{y}" stroke="{color}" stroke-width="2.5" stroke-dasharray="7 4"/>')
+            parts.append(f'<text x="{legend_x + 28}" y="{y + 4}" font-family="Arial, sans-serif" font-size="12" fill="#1f2933">pp</text>')
+            parts.append(f'<text x="{legend_x + 106}" y="{y + 4}" font-family="Arial, sans-serif" font-size="12" fill="#1f2933">tg {html.escape(label)}</text>')
+        else:
+            parts.append(f'<text x="{legend_x + 28}" y="{y + 4}" font-family="Arial, sans-serif" font-size="12" fill="#1f2933">pp {html.escape(label)}</text>')
         line_idx += 1
 
     parts.append("</svg>")
