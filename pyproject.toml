@@ -24,6 +24,7 @@ classifiers = [
 ]
 dependencies = [
     "openai",
+    "tokenizers",
     "transformers>=5.2.0",
     "tabulate",
     "numpy",

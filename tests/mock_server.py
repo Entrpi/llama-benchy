@@ -10,6 +10,8 @@ from pydantic import BaseModel
 import uvicorn
 from transformers import AutoTokenizer
 
+from llama_benchy.client import CONTEXT_LOAD_USER_MESSAGE
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mock_server")
@@ -124,6 +126,7 @@ async def chat_completions(request: ChatCompletionRequest):
     
     has_system = False
     has_user = False
+    user_messages = []
     
     # Pre-warm/Get tokenizer for consistency
     # (Doing this one by one might be slightly inefficient but accurate)
@@ -136,6 +139,7 @@ async def chat_completions(request: ChatCompletionRequest):
         elif msg.role == "user":
             user_tokens += t_count
             has_user = True
+            user_messages.append(msg.content)
         else:
             other_tokens += t_count
 
@@ -144,12 +148,18 @@ async def chat_completions(request: ChatCompletionRequest):
     # Emulate Prompt Processing Logic
     tokens_to_process = total_prompt_tokens
     
+    is_context_load_probe = (
+        has_system
+        and has_user
+        and all(content == CONTEXT_LOAD_USER_MESSAGE for content in user_messages)
+    )
+
     if has_system:
-        if user_tokens > 0:
+        if user_tokens > 0 and not is_context_load_probe:
             # Case: System + User (with content) -> System cached, User processed + lookup overhead
             tokens_to_process = user_tokens + other_tokens + 1
         else:
-            # Case: System + User (empty) -> Context preload / Warmup -> Full System processing
+            # Case: System + context-load probe -> Context preload / Warmup -> Full System processing
             tokens_to_process = total_prompt_tokens
             
     if request.cache_prompt is False:

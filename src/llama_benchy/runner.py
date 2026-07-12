@@ -8,7 +8,7 @@ import aiohttp
 
 from ._version import __version__
 from .config import BenchmarkConfig
-from .client import LLMClient
+from .client import CONTEXT_LOAD_USER_MESSAGE, LLMClient, PromptSuiteRequestResult
 from .prompts import PROMPT_SUITES, PromptGenerator
 from .results import BenchmarkResults, BenchmarkMetadata, PromptSuiteResults
 
@@ -16,15 +16,67 @@ class BenchmarkFailure(Exception):
     pass
 
 class BenchmarkRunner:
-    def __init__(self, config: BenchmarkConfig, client: LLMClient, prompt_generator: Optional[PromptGenerator]):
+    def __init__(self, config: BenchmarkConfig, client: LLMClient, prompt_generator: Optional[PromptGenerator], progress=None):
         self.config = config
         self.client = client
         self.prompt_gen = prompt_generator
         self.results = BenchmarkResults()
+        self.progress = progress
+        self._next_request_id = 0
 
         # We need to track deltas from warmup to adapt prompts
         self.delta_user = 0
         self.delta_context = 0
+
+    def _new_request_id(self) -> int:
+        rid = self._next_request_id
+        self._next_request_id += 1
+        return rid
+
+    def _emit_request_start(
+        self,
+        request_id: int,
+        pp: int,
+        tg: int,
+        depth: int,
+        concurrency: int,
+        run_index: int,
+        target_label: str = "",
+    ) -> None:
+        if self.progress is None:
+            return
+        try:
+            self.progress.request_start(
+                request_id=request_id,
+                model=self.config.model,
+                base_url=self.config.base_url,
+                prompt_size=pp,
+                response_size=tg,
+                context_size=depth,
+                concurrency=concurrency,
+                run_index=run_index,
+                target_label=target_label,
+            )
+        except Exception:
+            pass
+
+    def _emit_prompt_suite_request_end(
+        self,
+        request_id: int,
+        result: PromptSuiteRequestResult,
+    ) -> None:
+        if self.progress is None:
+            return
+        try:
+            self.progress.request_end(
+                request_id=request_id,
+                total_tokens=result.predicted_n,
+                prompt_tokens=result.prompt_tokens,
+                decode_seconds=0.0,
+                error=result.error or "",
+            )
+        except Exception:
+            pass
 
     async def run_suite(self):
         if self.config.prompt_suite:
@@ -63,6 +115,13 @@ class BenchmarkRunner:
 
                 # Measure latency
                 latency = await self.client.measure_latency(session, self.config.latency_mode)
+                if self.progress is not None:
+                    try:
+                        self.progress.latency_measured(
+                            latency_s=latency, mode=self.config.latency_mode
+                        )
+                    except Exception:
+                        pass
 
                 # Main Loop
                 for depth in self.config.depths:
@@ -106,13 +165,18 @@ class BenchmarkRunner:
                                         load_tasks = []
                                         for i in range(concurrency):
                                             context, _ = prompt_batch[i]
+                                            if not is_warmup:
+                                                rid = self._new_request_id()
+                                                self._emit_request_start(rid, pp, tg, depth, concurrency, run)
                                             load_tasks.append(self.client.run_generation(
                                                 session,
                                                 context_text=context,
-                                                prompt_text="",
+                                                prompt_text=CONTEXT_LOAD_USER_MESSAGE,
                                                 max_tokens=tg,
                                                 no_cache=self.config.no_cache,
-                                                tokenizer=tokenizer
+                                                tokenizer=tokenizer,
+                                                progress=None if is_warmup else self.progress,
+                                                request_id=None if is_warmup else rid,
                                             ))
 
                                         load_results = await asyncio.gather(*load_tasks)
@@ -129,13 +193,18 @@ class BenchmarkRunner:
                                         inf_tasks = []
                                         for i in range(concurrency):
                                             context, prompt = prompt_batch[i]
+                                            if not is_warmup:
+                                                rid = self._new_request_id()
+                                                self._emit_request_start(rid, pp, tg, depth, concurrency, run)
                                             inf_tasks.append(self.client.run_generation(
                                                 session,
                                                 context_text=context,
                                                 prompt_text=prompt,
                                                 max_tokens=tg,
                                                 no_cache=self.config.no_cache,
-                                                tokenizer=tokenizer
+                                                tokenizer=tokenizer,
+                                                progress=None if is_warmup else self.progress,
+                                                request_id=None if is_warmup else rid,
                                             ))
 
                                         batch_results = await asyncio.gather(*inf_tasks)
@@ -154,13 +223,18 @@ class BenchmarkRunner:
                                         batch_tasks = []
                                         for i in range(concurrency):
                                             context, prompt = prompt_batch[i]
+                                            if not is_warmup:
+                                                rid = self._new_request_id()
+                                                self._emit_request_start(rid, pp, tg, depth, concurrency, run)
                                             batch_tasks.append(self.client.run_generation(
                                                 session,
                                                 context_text=context,
                                                 prompt_text=prompt,
                                                 max_tokens=tg,
                                                 no_cache=self.config.no_cache,
-                                                tokenizer=tokenizer
+                                                tokenizer=tokenizer,
+                                                progress=None if is_warmup else self.progress,
+                                                request_id=None if is_warmup else rid,
                                             ))
 
                                         batch_results = await asyncio.gather(*batch_tasks)
@@ -247,6 +321,16 @@ class BenchmarkRunner:
             for run in range(1, self.config.suite_runs + 1):
                 for prompt in prompts:
                     print(f"Running prompt suite: {self.config.prompt_suite} run={run} prompt={prompt['name']}")
+                    request_id = self._new_request_id()
+                    self._emit_request_start(
+                        request_id,
+                        pp=0,
+                        tg=self.config.suite_max_tokens,
+                        depth=0,
+                        concurrency=1,
+                        run_index=run - 1,
+                        target_label=prompt["name"],
+                    )
                     result = await self.client.run_prompt_suite_generation(
                         session,
                         name=prompt["name"],
@@ -255,6 +339,7 @@ class BenchmarkRunner:
                         seed=self.config.suite_seed,
                         run=run,
                     )
+                    self._emit_prompt_suite_request_end(request_id, result)
                     suite_results.add(result)
                     if result.error:
                         if self.config.exit_on_first_fail:

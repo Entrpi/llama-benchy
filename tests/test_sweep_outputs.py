@@ -1,3 +1,5 @@
+import csv
+import io
 import sys
 
 from llama_benchy.config import BenchmarkConfig
@@ -75,3 +77,37 @@ def test_sweep_svg_contains_concurrency_series():
     assert "tg c1 pp2048 tg128" in svg_output
     assert "tg c2 pp2048 tg128" in svg_output
     assert "generation t/s total" in svg_output
+
+
+def test_sweep_outputs_preserve_prefill_when_generation_is_unavailable():
+    results = BenchmarkResults()
+    results.model_name = "diffusion-model"
+    results.runs.append(
+        BenchmarkRun(
+            concurrency=1,
+            context_size=2048,
+            prompt_size=2048,
+            response_size=128,
+            is_context_prefill_phase=False,
+            pp_throughput=metric(900.0),
+            pp_req_throughput=metric(900.0),
+            tg_throughput=None,
+            tg_req_throughput=None,
+            peak_throughput=metric(128.0),
+            peak_req_throughput=metric(128.0),
+            ttfr=metric(100.0),
+            est_ppt=metric(90.0),
+            e2e_ttft=metric(120.0),
+        )
+    )
+
+    rows = list(csv.DictReader(io.StringIO(results._generate_sweep_csv())))
+    assert len(rows) == 1
+    assert rows[0]["ctx_tokens"] == "2048"
+    assert rows[0]["prefill_tps"] == "900"
+    assert rows[0]["gen_tps"] == ""
+
+    svg_output = results._generate_sweep_svg("Prefill only")
+    assert "Prefill only" in svg_output
+    assert "pp c1 pp2048 tg128" in svg_output
+    assert "generation t/s total" not in svg_output

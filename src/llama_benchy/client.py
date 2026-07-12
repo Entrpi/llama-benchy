@@ -9,6 +9,17 @@ from typing import Optional, List, Dict, Any
 
 _warned_about_fallback = False
 
+# vLLM's Rust frontend rejects empty user content, so context preloads use a
+# tiny probe turn instead.
+CONTEXT_LOAD_USER_MESSAGE = "."
+
+
+def _warn_once(message: str):
+    global _warned_about_fallback
+    if not _warned_about_fallback:
+        print(message)
+        _warned_about_fallback = True
+
 @dataclass
 class RequestResult:
     start_ts: float = 0.0
@@ -36,11 +47,150 @@ class PromptSuiteRequestResult:
     error: Optional[str] = None
 
 class LLMClient:
-    def __init__(self, base_url: str, api_key: str, model_name: str):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model_name: str,
+        extra_body: Optional[Dict[str, Any]] = None,
+        exact_tg: bool = False,
+    ):
         self.base_url = base_url
         self.api_key = api_key
         self.model_name = model_name
+        self.extra_body = extra_body or {}
+        self.exact_tg = exact_tg
         self.headers = {"Authorization": f"Bearer {api_key}"}
+
+    def _build_generation_payload(self, messages: List[Dict[str, str]], max_tokens: int, no_cache: bool) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "model": self.model_name,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "stream": True,
+            "return_token_ids": True,
+            "stream_options": {"include_usage": True},
+        }
+
+        if no_cache:
+            payload["cache_prompt"] = False
+
+        payload.update(self.extra_body)
+
+        if self.exact_tg:
+            payload["max_tokens"] = max_tokens
+            payload["min_tokens"] = max_tokens
+            payload["ignore_eos"] = True
+
+        return payload
+
+    def _build_prompt_suite_payload(
+        self,
+        prompt: str,
+        max_tokens: int,
+        seed: Optional[int],
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+        }
+        payload.update(self.extra_body)
+
+        # Prompt suites rely on llama.cpp's non-streaming timings object.
+        payload["stream"] = False
+        if seed is not None:
+            payload["seed"] = seed
+
+        if self.exact_tg:
+            payload["max_tokens"] = max_tokens
+            payload["min_tokens"] = max_tokens
+            payload["ignore_eos"] = True
+
+        return payload
+
+    @staticmethod
+    def _non_empty_user_content(content: str) -> str:
+        if content.strip():
+            return content
+        return CONTEXT_LOAD_USER_MESSAGE
+
+    @staticmethod
+    def _append_observed_token_timestamps(result: RequestResult, chunk_time: float, token_count: int):
+        if token_count <= 0:
+            return
+
+        if token_count == 1:
+            result.token_timestamps.append(chunk_time)
+            return
+
+        last_ts = result.token_timestamps[-1] if result.token_timestamps else result.first_token_ts
+        if last_ts is None:
+            last_ts = result.start_ts
+        time_window = chunk_time - last_ts
+        for i in range(token_count):
+            ts = last_ts + (time_window * (i + 1) / token_count)
+            result.token_timestamps.append(ts)
+
+    @staticmethod
+    def _interpolate_token_timestamps(chunk_times: List[float], token_count: int) -> List[float]:
+        if token_count <= 0 or not chunk_times:
+            return []
+
+        if token_count == 1 or len(chunk_times) == 1:
+            return [chunk_times[0]] * token_count
+
+        first_ts = chunk_times[0]
+        last_ts = chunk_times[-1]
+        if last_ts <= first_ts:
+            return [first_ts] * token_count
+
+        step = (last_ts - first_ts) / (token_count - 1)
+        return [first_ts + (step * i) for i in range(token_count)]
+
+    def _finalize_stream_tokens(
+            self,
+            result: RequestResult,
+            content_chunks: List[Dict[str, Any]],
+            usage_completion_tokens: Optional[int],
+            tokenizer=None
+        ):
+        if not content_chunks:
+            if usage_completion_tokens is not None:
+                result.total_tokens = usage_completion_tokens
+            return
+
+        token_id_chunks = [
+            chunk for chunk in content_chunks
+            if isinstance(chunk.get("token_ids"), list)
+        ]
+
+        if len(token_id_chunks) == len(content_chunks):
+            for chunk in content_chunks:
+                token_count = len(chunk["token_ids"])
+                result.total_tokens += token_count
+                self._append_observed_token_timestamps(result, chunk["timestamp"], token_count)
+            return
+
+        chunk_times = [chunk["timestamp"] for chunk in content_chunks]
+
+        if usage_completion_tokens is not None:
+            _warn_once("  No complete token_ids in response, using stream usage token count")
+            result.total_tokens = usage_completion_tokens
+            result.token_timestamps = self._interpolate_token_timestamps(chunk_times, usage_completion_tokens)
+            return
+
+        if tokenizer is not None:
+            _warn_once("  No token_ids or usage in response, using local tokenization")
+            full_content = "".join(chunk["text"] for chunk in content_chunks)
+            token_count = len(tokenizer.encode(full_content, add_special_tokens=False))
+            result.total_tokens = token_count
+            result.token_timestamps = self._interpolate_token_timestamps(chunk_times, token_count)
+            return
+
+        _warn_once("  No token_ids, usage, or tokenizer, assuming 1 token per chunk")
+        result.total_tokens = len(content_chunks)
+        result.token_timestamps = chunk_times
 
     async def measure_latency(self, session: aiohttp.ClientSession, mode: str = "api") -> float:
         if mode == "none":
@@ -146,15 +296,15 @@ class LLMClient:
 
             if tokenizer:
                 # 2. Context Only
-                payload_sys_empty = {
+                payload_sys_probe = {
                     "model": self.model_name,
                     "messages": [
                         {"role": "system", "content": warmup_text},
-                        {"role": "user", "content": ""}
+                        {"role": "user", "content": CONTEXT_LOAD_USER_MESSAGE}
                     ],
                     "max_tokens": 1
                 }
-                async with session.post(f"{self.base_url}/chat/completions", json=payload_sys_empty, headers=self.headers) as response:
+                async with session.post(f"{self.base_url}/chat/completions", json=payload_sys_probe, headers=self.headers) as response:
                     if response.status != 200:
                         error_text = await response.text()
                         print(f"Warmup failed: HTTP {response.status}: {error_text}")
@@ -163,8 +313,9 @@ class LLMClient:
                     if 'usage' in response_json:
                         prompt_tokens = response_json['usage']['prompt_tokens']
                         local_tokens = len(tokenizer.encode(warmup_text, add_special_tokens=False))
-                        delta_context = prompt_tokens - local_tokens
-                        print(f"Warmup (System+Empty) complete. Delta: {delta_context} tokens (Server: {prompt_tokens}, Local: {local_tokens})")
+                        probe_tokens = len(tokenizer.encode(CONTEXT_LOAD_USER_MESSAGE, add_special_tokens=False))
+                        delta_context = prompt_tokens - local_tokens - probe_tokens
+                        print(f"Warmup (System+Probe) complete. Delta: {delta_context} tokens (Server: {prompt_tokens}, Local context: {local_tokens}, Probe: {probe_tokens})")
                     else:
                         delta_context = delta_user
         except Exception as e:
@@ -173,34 +324,26 @@ class LLMClient:
         return delta_user, delta_context
 
     async def run_generation(
-            self, 
-            session: aiohttp.ClientSession, 
-            context_text: str, 
-            prompt_text: str, 
-            max_tokens: int, 
+            self,
+            session: aiohttp.ClientSession,
+            context_text: str,
+            prompt_text: str,
+            max_tokens: int,
             no_cache: bool,
-            tokenizer=None
+            tokenizer=None,
+            progress=None,
+            request_id: Optional[int] = None,
         ) -> RequestResult:
 
         messages = []
         if context_text:
             messages.append({"role": "system", "content": context_text})
-        messages.append({"role": "user", "content": prompt_text})
+        messages.append({"role": "user", "content": self._non_empty_user_content(prompt_text)})
         
         result = RequestResult()
         
         try:
-            payload = {
-                "model": self.model_name,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "stream": True,
-                "return_token_ids": True,
-                "stream_options": {"include_usage": True},
-            }
-            
-            if no_cache:
-                payload["cache_prompt"] = False
+            payload = self._build_generation_payload(messages, max_tokens, no_cache)
             
             result.start_ts = time.perf_counter()
 
@@ -210,10 +353,13 @@ class LLMClient:
                     result.end_ts = time.perf_counter()
                     result.error = f"HTTP {response.status}: {error_text}"
                     print(result.error)
+                    self._emit_request_end(progress, request_id, result)
                     return result
 
                 decoder = codecs.getincrementaldecoder("utf-8")(errors='replace')
                 buffer = ""
+                content_chunks: List[Dict[str, Any]] = []
+                usage_completion_tokens: Optional[int] = None
                 
                 async for chunk_bytes in response.content.iter_any():
                     chunk_time = time.perf_counter()
@@ -234,70 +380,78 @@ class LLMClient:
                                 json_str = line[5:].strip()
                                 chunk = json.loads(json_str)
 
-                                if 'usage' in chunk and chunk['usage'] is not None:
-                                    result.prompt_tokens = chunk['usage'].get('prompt_tokens', 0)
+                                usage = chunk.get('usage')
+                                if isinstance(usage, dict):
+                                    prompt_tokens = usage.get('prompt_tokens')
+                                    if isinstance(prompt_tokens, int):
+                                        result.prompt_tokens = prompt_tokens
+                                    completion_tokens = usage.get('completion_tokens')
+                                    if isinstance(completion_tokens, int) and completion_tokens >= 0:
+                                        usage_completion_tokens = completion_tokens
                                 
                                 if 'choices' in chunk and len(chunk['choices']) > 0:
                                     if result.first_response_ts is None:
                                         result.first_response_ts = chunk_time
+                                        if progress is not None and request_id is not None:
+                                            try:
+                                                progress.request_first_response(
+                                                    request_id=request_id,
+                                                    ttfr_s=chunk_time - result.start_ts,
+                                                )
+                                            except Exception:
+                                                pass
 
                                     delta = chunk['choices'][0].get('delta', {})
                                     content = delta.get('content')
                                     reasoning_content = delta.get('reasoning_content')
                                     reasoning = delta.get('reasoning')
-                                    
+
                                     if content or reasoning_content or reasoning:
                                         if result.first_token_ts is None:
                                             result.first_token_ts = chunk_time
-                                        
+                                            if progress is not None and request_id is not None:
+                                                try:
+                                                    progress.request_first_token(
+                                                        request_id=request_id,
+                                                        ttft_s=chunk_time - result.start_ts,
+                                                    )
+                                                except Exception:
+                                                    pass
+
                                         token_ids = chunk['choices'][0].get('token_ids')
-                                        if token_ids and isinstance(token_ids, list):
-                                            result.total_tokens += len(token_ids)
-                                            if len(token_ids) == 1:
-                                                result.token_timestamps.append(chunk_time)
-                                            else:
-                                                last_ts = result.token_timestamps[-1] if result.token_timestamps else result.first_token_ts
-                                                if last_ts is None:
-                                                    last_ts = result.start_ts
-                                                time_window = chunk_time - last_ts
-                                                for i in range(len(token_ids)):
-                                                    ts = last_ts + (time_window * (i + 1) / len(token_ids))
-                                                    result.token_timestamps.append(ts)
-                                        elif tokenizer is not None:
-                                            global _warned_about_fallback
-                                            if not _warned_about_fallback:
-                                                print("  No token_ids in response, using local tokenization")
-                                                _warned_about_fallback = True
-                                            
-                                            full_content = content or reasoning_content or reasoning
-                                            token_count = len(tokenizer.encode(full_content, add_special_tokens=False))
-                                            result.total_tokens += token_count
-                                            if token_count == 1:
-                                                result.token_timestamps.append(chunk_time)
-                                            else:
-                                                last_ts = result.token_timestamps[-1] if result.token_timestamps else result.first_token_ts
-                                                if last_ts is None:
-                                                    last_ts = result.start_ts
-                                                time_window = chunk_time - last_ts
-                                                for i in range(token_count):
-                                                    ts = last_ts + (time_window * (i + 1) / token_count)
-                                                    result.token_timestamps.append(ts)
-                                        else:
-                                            if not _warned_about_fallback:
-                                                print("  No token_ids or tokenizer, assuming 1 token per chunk")
-                                                _warned_about_fallback = True
-                                            
-                                            result.total_tokens += 1
-                                            result.token_timestamps.append(chunk_time)
+                                        text = content or reasoning_content or reasoning
+                                        content_chunks.append({
+                                            "text": text,
+                                            "timestamp": chunk_time,
+                                            "token_ids": token_ids,
+                                        })
+
+                                        if progress is not None and request_id is not None:
+                                            # Best-effort per-chunk count for the live stream.
+                                            # The authoritative total is reconciled in
+                                            # _finalize_stream_tokens and reported by request_end.
+                                            has_token_ids = isinstance(token_ids, list)
+                                            chunk_count = len(token_ids) if has_token_ids else 1
+                                            try:
+                                                progress.tokens(
+                                                    request_id=request_id,
+                                                    count=chunk_count,
+                                                    snippet=text or "",
+                                                    estimated=not has_token_ids,
+                                                )
+                                            except Exception:
+                                                pass
                             except json.JSONDecodeError:
                                 continue
-            
-            result.end_ts = time.perf_counter()
+
+                self._finalize_stream_tokens(result, content_chunks, usage_completion_tokens, tokenizer)
+                result.end_ts = time.perf_counter()
 
         except Exception as e:
             print(f"Error during run: {e}")
             result.error = str(e)
-        
+
+        self._emit_request_end(progress, request_id, result)
         return result
 
     async def run_prompt_suite_generation(
@@ -310,13 +464,7 @@ class LLMClient:
             run: int = 1,
         ) -> PromptSuiteRequestResult:
         result = PromptSuiteRequestResult(name=name, run=run)
-        payload: Dict[str, Any] = {
-            "model": self.model_name,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-        }
-        if seed is not None:
-            payload["seed"] = seed
+        payload = self._build_prompt_suite_payload(prompt, max_tokens, seed)
 
         try:
             result.start_ts = time.perf_counter()
@@ -358,3 +506,22 @@ class LLMClient:
                 result.wall_s = result.end_ts - result.start_ts
 
         return result
+
+    @staticmethod
+    def _emit_request_end(progress, request_id: Optional[int], result: "RequestResult") -> None:
+        """Emit the request_end progress event for a finished request."""
+        if progress is None or request_id is None:
+            return
+        decode_seconds = 0.0
+        if result.first_token_ts is not None and result.end_ts:
+            decode_seconds = max(0.0, result.end_ts - result.first_token_ts)
+        try:
+            progress.request_end(
+                request_id=request_id,
+                total_tokens=result.total_tokens,
+                prompt_tokens=result.prompt_tokens,
+                decode_seconds=decode_seconds,
+                error=result.error or "",
+            )
+        except Exception:
+            pass

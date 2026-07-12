@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import argparse
+import json
 import os
 import re
 import requests
@@ -24,6 +25,10 @@ class BenchmarkConfig(BaseModel):
         ..., description="List of prompt processing token counts"
     )
     tg_counts: List[int] = Field(..., description="List of token generation counts")
+    exact_tg: bool = Field(
+        False,
+        description="Force generated output length to match --tg using server-specific min_tokens and ignore_eos fields",
+    )
     depths: List[int] = Field(
         ..., description="List of context depths (previous conversation tokens)"
     )
@@ -78,6 +83,44 @@ class BenchmarkConfig(BaseModel):
     suite_max_tokens: int = Field(192, description="Maximum generated tokens per prompt-suite request")
     suite_seed: Optional[int] = Field(42, description="Seed sent with prompt-suite requests")
     suite_runs: int = Field(1, description="Number of prompt-suite passes")
+    extra_body: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Extra JSON fields to merge into benchmark chat completion requests",
+    )
+    emit_progress: Optional[str] = Field(
+        None,
+        description="Emit progress events as JSONL to PATH (or '-' for stdout). See docs/progress-schema.md.",
+    )
+
+    @staticmethod
+    def _parse_extra_body(values: Optional[List[str]]) -> Dict[str, Any]:
+        extra: Dict[str, Any] = {}
+        if not values:
+            return extra
+
+        for item in values:
+            entries = [entry.strip() for entry in item.split(",") if entry.strip()]
+            for entry in entries:
+                if "=" in entry:
+                    key, raw_value = entry.split("=", 1)
+                elif ":" in entry:
+                    key, raw_value = entry.split(":", 1)
+                else:
+                    raise ValueError(
+                        f"Invalid --extra-body entry '{entry}'. Use key=value or key:value."
+                    )
+
+                key = key.strip()
+                raw_value = raw_value.strip()
+                if not key:
+                    raise ValueError(f"Invalid --extra-body entry '{entry}': empty key.")
+
+                try:
+                    extra[key] = json.loads(raw_value)
+                except json.JSONDecodeError:
+                    extra[key] = raw_value
+
+        return extra
 
     @staticmethod
     def _detect_hf_model_from_endpoint(base_url: str, api_key: str) -> Tuple[str, str]:
@@ -222,6 +265,11 @@ class BenchmarkConfig(BaseModel):
             required=False,
             default=[32],
             help="List of token generation counts - default: 32",
+        )
+        parser.add_argument(
+            "--exact-tg",
+            action="store_true",
+            help="Force output length to match --tg by sending min_tokens=<tg> and ignore_eos=true in benchmark requests.",
         )
         parser.add_argument(
             "--depth",
@@ -383,6 +431,23 @@ class BenchmarkConfig(BaseModel):
             default=1,
             help="Number of prompt-suite passes - default: 1",
         )
+        parser.add_argument(
+            "--extra-body",
+            action="append",
+            default=[],
+            help="Extra JSON fields to merge into benchmark chat completion requests. Accepts key=value or key:value, comma-separated or repeated.",
+        )
+        parser.add_argument(
+            "--emit-progress",
+            type=str,
+            default=None,
+            metavar="PATH",
+            help=(
+                "Emit benchmark progress events as JSONL to PATH (or '-' for stdout). "
+                "External visualizers (live TUIs, web dashboards, post-hoc charts) "
+                "consume this stream. Schema: docs/progress-schema.md."
+            ),
+        )
 
         args = parser.parse_args()
 
@@ -405,6 +470,12 @@ class BenchmarkConfig(BaseModel):
                 args.depth = list(range(args.sweep_start, args.sweep_max + 1, args.sweep_step))
             else:
                 args.depth = [0]
+
+        try:
+            extra_body = BenchmarkConfig._parse_extra_body(args.extra_body)
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
 
         # Auto-detect model if not specified
         if args.model is None:
@@ -437,6 +508,7 @@ class BenchmarkConfig(BaseModel):
             tokenizer=args.tokenizer,
             pp_counts=args.pp,
             tg_counts=args.tg,
+            exact_tg=args.exact_tg,
             depths=args.depth,
             num_runs=args.runs,
             no_cache=args.no_cache,
@@ -465,4 +537,6 @@ class BenchmarkConfig(BaseModel):
             suite_max_tokens=args.suite_max_tokens,
             suite_seed=args.suite_seed,
             suite_runs=args.suite_runs,
+            extra_body=extra_body,
+            emit_progress=args.emit_progress,
         )
