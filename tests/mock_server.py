@@ -111,6 +111,15 @@ async def list_models():
 COHERENCE_TEST_PROMPT = "What is the capital of France? Please reply with one word only"
 COHERENCE_TEST_RESPONSE = "Paris"
 
+# Fragment-streaming mode (model name contains "fragments"): emulates servers
+# that stream multi-character text deltas WITHOUT token_ids. Each true token
+# (" thinking" = one gpt2 token) is split across two deltas (" think" + "ing",
+# one gpt2 token each), so per-fragment retokenization over-counts 2x — the
+# bug class fixed in 5a05ab4. Model name containing "nousage" additionally
+# suppresses the streaming usage chunk, forcing joined-text retokenization.
+FRAGMENT_TOKEN_TEXT = " thinking"
+FRAGMENT_PARTS = [" think", "ing"]
+
 
 @app.post("/chat/completions")
 @app.post("/v1/chat/completions")
@@ -184,6 +193,9 @@ async def chat_completions(request: ChatCompletionRequest):
     if adjusted_prompt_delay > 0:
         await asyncio.sleep(adjusted_prompt_delay)
 
+    fragment_mode = "fragments" in request.model
+    omit_stream_usage = "nousage" in request.model
+
     if request.stream:
         async def event_generator():
             # Generate tokens
@@ -195,15 +207,8 @@ async def chat_completions(request: ChatCompletionRequest):
 
             include_token_ids = request.return_token_ids if hasattr(request, 'return_token_ids') else False
 
-            for i in range(num_completion_tokens):
-                target_time = stream_start_time + ((i + 1) * token_interval)
-                now = time.perf_counter()
-                sleep_duration = target_time - now
-
-                if sleep_duration > 0:
-                    await asyncio.sleep(sleep_duration)
-                
-                chunk = {
+            def make_chunk(delta_text):
+                return {
                     "id": request_id,
                     "object": "chat.completion.chunk",
                     "created": created_time,
@@ -211,16 +216,39 @@ async def chat_completions(request: ChatCompletionRequest):
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {"content": token_text},
+                            "delta": {"content": delta_text},
                             "finish_reason": None
                         }
                     ]
                 }
-                
-                if include_token_ids:
-                    chunk["choices"][0]["token_ids"] = [single_token_id] * mtp_factor
-                
-                yield f"data: {json.dumps(chunk)}\n\n"
+
+            if fragment_mode:
+                # Multi-character deltas, no token_ids: each true token is
+                # emitted as len(FRAGMENT_PARTS) fragments, paced so joined-text
+                # tokens flow at GEN_SPEED_TPS.
+                n_parts = len(FRAGMENT_PARTS)
+                for i in range(num_completion_tokens):
+                    for j, part in enumerate(FRAGMENT_PARTS):
+                        target_time = stream_start_time + (i + (j + 1) / n_parts) * token_interval
+                        sleep_duration = target_time - time.perf_counter()
+                        if sleep_duration > 0:
+                            await asyncio.sleep(sleep_duration)
+                        yield f"data: {json.dumps(make_chunk(part))}\n\n"
+            else:
+                for i in range(num_completion_tokens):
+                    target_time = stream_start_time + ((i + 1) * token_interval)
+                    now = time.perf_counter()
+                    sleep_duration = target_time - now
+
+                    if sleep_duration > 0:
+                        await asyncio.sleep(sleep_duration)
+
+                    chunk = make_chunk(token_text)
+
+                    if include_token_ids:
+                        chunk["choices"][0]["token_ids"] = [single_token_id] * mtp_factor
+
+                    yield f"data: {json.dumps(chunk)}\n\n"
             
             # Final finish chunk
             final_chunk = {
@@ -239,7 +267,7 @@ async def chat_completions(request: ChatCompletionRequest):
             yield f"data: {json.dumps(final_chunk)}\n\n"
             
             # Usage chunk if requested
-            if request.stream_options and request.stream_options.get("include_usage"):
+            if request.stream_options and request.stream_options.get("include_usage") and not omit_stream_usage:
                 usage_chunk = {
                     "id": request_id,
                     "object": "chat.completion.chunk",

@@ -305,10 +305,26 @@ class LLMClient:
             # per-delta token_ids (exact) > server usage count > retokenize the
             # JOINED text. Never per-fragment counting for the total.
             if not saw_token_ids:
+                corrected_tokens = 0
                 if usage_completion_tokens > 0:
-                    result.total_tokens = usage_completion_tokens
+                    corrected_tokens = usage_completion_tokens
                 elif fallback_texts and tokenizer is not None:
-                    result.total_tokens = len(tokenizer.encode("".join(fallback_texts), add_special_tokens=False))
+                    corrected_tokens = len(tokenizer.encode("".join(fallback_texts), add_special_tokens=False))
+                if corrected_tokens > 0:
+                    result.total_tokens = corrected_tokens
+                    # token_timestamps feed peak throughput, so the per-fragment
+                    # over-count inflates it by the same factor. Resample the
+                    # series to the corrected count, preserving its time profile.
+                    timestamps = result.token_timestamps
+                    if len(timestamps) >= 2 and len(timestamps) != corrected_tokens:
+                        result.token_timestamps = [
+                            float(timestamp)
+                            for timestamp in np.interp(
+                                np.linspace(0, len(timestamps) - 1, corrected_tokens),
+                                np.arange(len(timestamps)),
+                                timestamps,
+                            )
+                        ]
 
         except Exception as e:
             print(f"Error during run: {e}")

@@ -203,6 +203,82 @@ async def test_mtp_integration(mock_server_url):
     )
 
 
+def _run_benchy_json(cmd_args: List[str]) -> List[Dict[str, Any]]:
+    """Run the llama-benchy CLI and return the parsed benchmark list."""
+    cmd = [sys.executable, "-m", "llama_benchy"] + cmd_args
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print("STDOUT:", result.stdout)
+        print("STDERR:", result.stderr)
+        pytest.fail("llama-benchy command failed")
+
+    stdout = result.stdout
+    json_start = stdout.find('{')
+    if json_start == -1:
+        json_start = stdout.find('[')
+    if json_start == -1:
+        print("Output:\n", stdout)
+        pytest.fail("Could not find JSON output")
+
+    json_end = stdout.rfind('}') + 1 if stdout[json_start] == '{' else stdout.rfind(']') + 1
+    data = json.loads(stdout[json_start:json_end])
+
+    if isinstance(data, dict) and "benchmarks" in data:
+        return data["benchmarks"]
+    return data if isinstance(data, list) else [data]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["test-model-fragments", "test-model-fragments-nousage"])
+async def test_fragment_fallback_throughput(mock_server_url, model):
+    """
+    Servers that stream multi-character text deltas WITHOUT token_ids must not
+    over-count generation tokens (5a05ab4: per-fragment retokenization lost
+    merges across delta boundaries, ~2x over-count). The mock's fragment mode
+    streams each true token (" thinking", one gpt2 token) as two deltas
+    (" think" + "ing") at a true rate of 50 tok/s:
+      - test-model-fragments: streaming usage present -> usage.completion_tokens path
+      - test-model-fragments-nousage: no streaming usage -> joined-text retokenization path
+    Pre-fix per-fragment counting reports ~100 tok/s and fails this test, for
+    both gen throughput (total_tokens) and peak throughput (token_timestamps).
+    """
+    # Guard: the fragment split must actually over-count when retokenized
+    # per-fragment, or this test cannot discriminate the fixed fallback from
+    # the broken one.
+    from tests.mock_server import FRAGMENT_PARTS, FRAGMENT_TOKEN_TEXT, count_tokens
+    per_fragment = sum(count_tokens(p, "test") for p in FRAGMENT_PARTS)
+    joined = count_tokens(FRAGMENT_TOKEN_TEXT, "test")
+    assert per_fragment >= 2 * joined, (
+        f"Fragment split no longer over-counts ({per_fragment} vs {joined} joined); "
+        "pick a new FRAGMENT_TOKEN_TEXT/FRAGMENT_PARTS in mock_server.py"
+    )
+
+    benchmarks = _run_benchy_json([
+        "--base-url", mock_server_url,
+        "--model", model,
+        "--depth", "0",
+        "--format", "json",
+    ])
+
+    baseline = next((b for b in benchmarks if b.get("context_size") == 0), None)
+    assert baseline, "Missing baseline result (depth 0)"
+
+    gen_speed = baseline["tg_throughput"]["mean"]
+    print(f"Fragment fallback ({model}) gen speed: {gen_speed} t/s")
+    assert 45 < gen_speed < 55, (
+        f"Gen speed {gen_speed:.1f} t/s outside 45-55; ~100 means per-fragment "
+        "token counting has regressed"
+    )
+
+    peak_speed = baseline["peak_throughput"]["mean"]
+    print(f"Fragment fallback ({model}) peak speed: {peak_speed} t/s")
+    assert 40 < peak_speed < 65, (
+        f"Peak speed {peak_speed:.1f} t/s outside 40-65; ~100 means "
+        "token_timestamps were not corrected for per-fragment over-count"
+    )
+
+
 @pytest.mark.asyncio
 async def test_mtp_bench_prompt_suite(mock_server_url, tmp_path):
     """
